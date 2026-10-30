@@ -16,19 +16,33 @@ concurrency:
 
 env:
   OWRT_IMAGE: openwrt/rootfs:x86-64-openwrt-24.10
-  # Thêm/bớt app LuCI muốn chụp (cách nhau bằng dấu cách)
+  # App LuCI muốn cài và chụp (cách nhau bằng dấu cách)
   EXTRA_PKGS: luci-app-sqm luci-app-upnp luci-app-ddns luci-app-wol
+  # true = job đỏ (không deploy) nếu có lỗi mức "error"; false = chỉ báo, vẫn deploy
+  FAIL_ON_ERROR: 'false'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      # ---------- Hàm ghi kết quả kiểm tra ----------
+      - name: Init check helpers
+        run: |
+          mkdir -p checks
+          : > checks/errors
+          : > checks/warns
+          cat > checks/lib.sh <<'END_LIB'
+          ok()   { echo "ok: $1";             echo "- ✅ $1" >> "$GITHUB_STEP_SUMMARY"; }
+          warn() { echo "::warning::$1";      echo "- ⚠️ $1" >> "$GITHUB_STEP_SUMMARY"; echo x >> checks/warns; }
+          fail() { echo "::error::$1";        echo "- ❌ $1" >> "$GITHUB_STEP_SUMMARY"; echo x >> checks/errors; }
+          END_LIB
 
       - name: Install dependencies
         run: npm install
@@ -38,13 +52,125 @@ jobs:
           mkdir -p build/luci-static/material3
           npx sass styles/cascade.scss build/luci-static/material3/cascade.css --no-source-map
 
+      # ---------- Kiểm tra tĩnh (chưa cần router) ----------
+      - name: Static checks
+        run: |
+          set +e
+          source checks/lib.sh
+          echo "## Kiểm tra tĩnh" >> "$GITHUB_STEP_SUMMARY"
+
+          for f in \
+            ucode/template/themes/material3/header.ut \
+            ucode/template/themes/material3/footer.ut \
+            ucode/template/themes/material3/sysauth.ut \
+            htdocs/luci-static/material3/js/ripple.js \
+            htdocs/luci-static/material3/logo.svg \
+            htdocs/luci-static/resources/menu-material3.js \
+            htdocs/luci-static/resources/view/material3/sysauth.js \
+            styles/cascade.scss \
+            root/etc/uci-defaults/30_luci-theme-material3 \
+            Makefile LICENSE; do
+            if [ -f "$f" ]; then ok "Có file $f"; else fail "Thiếu file $f"; fi
+          done
+
+          n=$(ls htdocs/luci-static/material3/fonts/*.woff2 2>/dev/null | wc -l)
+          if [ "$n" -gt 0 ]; then ok "Có $n file font woff2"; else fail "Không có font woff2"; fi
+
+          sz=$(stat -c%s build/luci-static/material3/cascade.css)
+          if [ "$sz" -gt 20000 ]; then ok "cascade.css biên dịch được ($sz byte)"; else fail "cascade.css quá nhỏ ($sz byte)"; fi
+
+          for f in ucode/template/themes/material3/*.ut; do
+            o1=$(grep -o '{%' "$f" | wc -l); c1=$(grep -o '%}' "$f" | wc -l)
+            o2=$(grep -o '{{' "$f" | wc -l); c2=$(grep -o '}}' "$f" | wc -l)
+            if [ "$o1" -eq "$c1" ] && [ "$o2" -eq "$c2" ]; then
+              ok "Template $(basename "$f"): cặp {% %} ($o1) và {{ }} ($o2) cân bằng"
+            else
+              fail "Template $(basename "$f"): lệch cặp {% %} ($o1/$c1) hoặc {{ }} ($o2/$c2)"
+            fi
+          done
+
+          rm -rf stage
+          mkdir stage
+          cp -r htdocs/. stage/
+          cp build/luci-static/material3/cascade.css stage/luci-static/material3/cascade.css
+
+          cat > checks/static.mjs <<'END_STATIC'
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const root = 'stage';
+          const say = (l, m) => console.log(l + '|' + m);
+
+          function walk(d, out = []) {
+            for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+              const p = path.join(d, e.name);
+              if (e.isDirectory()) walk(p, out);
+              else out.push(p);
+            }
+            return out;
+          }
+
+          // 1. url() trong CSS phải trỏ tới file có thật
+          const cssPath = root + '/luci-static/material3/cascade.css';
+          const css = fs.readFileSync(cssPath, 'utf8');
+          const urls = [...css.matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/g)].map(m => m[2]);
+          const missing = [];
+          const external = [];
+          for (const u of new Set(urls)) {
+            if (!u || u.startsWith('data:') || u.startsWith('#')) continue;
+            if (/^(https?:)?\/\//.test(u)) { external.push(u); continue; }
+            const clean = u.split(/[?#]/)[0];
+            const target = clean.startsWith('/')
+              ? path.join(root, clean)
+              : path.resolve(path.dirname(cssPath), clean);
+            if (!fs.existsSync(target)) missing.push(u);
+          }
+          if (missing.length) say('FAIL', 'CSS tham chiếu file không tồn tại: ' + missing.join(', '));
+          else say('OK', 'Mọi url() trong cascade.css trỏ tới file có thật (' + urls.length + ' tham chiếu)');
+          if (external.length) say('WARN', 'CSS gọi tài nguyên ngoài: ' + external.slice(0, 3).join(', '));
+
+          // 2. @font-face
+          const ff = (css.match(/@font-face/g) || []).length;
+          if (ff > 0) say('OK', 'CSS có ' + ff + ' khối @font-face');
+          else say('WARN', 'CSS không có @font-face nào');
+
+          // 3. Cú pháp mọi file JS (LuCI dùng "return" ở top-level nên bọc trong Function)
+          let jsCount = 0, jsBad = 0;
+          for (const f of walk(root).filter(f => f.endsWith('.js'))) {
+            jsCount++;
+            try { new Function(fs.readFileSync(f, 'utf8')); }
+            catch (e) { jsBad++; say('FAIL', 'JS lỗi cú pháp ' + f.replace(root + '/', '') + ': ' + e.message); }
+          }
+          if (!jsBad) say('OK', 'Cú pháp JS hợp lệ (' + jsCount + ' file)');
+
+          // 4. Đường dẫn tuyệt đối /luci-static/ trong JS có file thật
+          const refMissing = new Set();
+          for (const f of walk(root).filter(f => f.endsWith('.js'))) {
+            const src = fs.readFileSync(f, 'utf8');
+            for (const m of src.matchAll(/['"`](\/luci-static\/[A-Za-z0-9_\-./]+\.[a-z0-9]+)['"`]/g)) {
+              if (!fs.existsSync(path.join(root, m[1]))) refMissing.add(m[1]);
+            }
+          }
+          if (refMissing.size) say('WARN', 'JS nhắc tới file chưa thấy trong htdocs (có thể nằm ở luci-base): ' + [...refMissing].slice(0, 5).join(', '));
+          else say('OK', 'Đường dẫn /luci-static/ trong JS đều có file');
+          END_STATIC
+
+          node checks/static.mjs | while IFS='|' read -r lvl msg; do
+            case "$lvl" in
+              OK) ok "$msg" ;;
+              WARN) warn "$msg" ;;
+              FAIL) fail "$msg" ;;
+            esac
+          done
+
       # ---------- Chuẩn bị image OpenWrt (mạng Docker còn nguyên, chưa chạy init) ----------
       - name: Prepare OpenWrt image
         run: |
           docker run -d --name prep "$OWRT_IMAGE" sleep infinity
           docker exec prep mkdir -p /var/lock /var/run
           docker exec prep sed -i 's#https://#http://#g' /etc/opkg/distfeeds.conf
-          docker exec prep sh -c 'opkg update && opkg install luci'
+          docker exec prep opkg update
+          docker exec prep opkg install luci
           for p in $EXTRA_PKGS; do
             docker exec prep opkg install "$p" || echo "::warning::Không cài được $p"
           done
@@ -57,7 +183,7 @@ jobs:
           docker cp root/. prep:/ || true
 
           # Mạng giả lập: 2 bridge rỗng, không đụng eth0 của Docker
-          cat > network.conf <<'EOF'
+          cat > network.conf <<'END_NET'
           config interface 'loopback'
               option device 'lo'
               option proto 'static'
@@ -92,10 +218,10 @@ jobs:
               option gateway '203.0.113.1'
               list dns '1.1.1.1'
               list dns '8.8.8.8'
-          EOF
+          END_NET
           docker cp network.conf prep:/etc/config/network
 
-          cat > system.conf <<'EOF'
+          cat > system.conf <<'END_SYS'
           config system
               option hostname 'Material3-Router'
               option timezone '<+07>-7'
@@ -103,16 +229,40 @@ jobs:
               option ttylogin '0'
               option log_size '64'
               option urandom_seed '0'
-          EOF
+          END_SYS
           docker cp system.conf prep:/etc/config/system
 
-          cat > board.json <<'EOF'
+          cat > board.json <<'END_BOARD'
           {"model":{"id":"material3,demo","name":"Material3 Demo Router"},
            "network":{"lan":{"device":"br-lan","protocol":"static"},
                       "wan":{"device":"br-wan","protocol":"static"}}}
-          EOF
+          END_BOARD
           docker cp board.json prep:/etc/board.json
 
-          docker exec prep sh -c '
-            set -x
-            printf "root\nroot\n"
+          cat > setup.sh <<'END_SETUP'
+          printf "root\nroot\n" | passwd root
+
+          uci set luci.themes.Material3=/luci-static/material3
+          uci set luci.main.mediaurlbase=/luci-static/material3
+          uci commit luci
+
+          uci add dhcp host
+          uci set dhcp.@host[-1].name="nas"
+          uci set dhcp.@host[-1].mac="aa:bb:cc:11:22:10"
+          uci set dhcp.@host[-1].ip="192.168.1.20"
+          uci add dhcp host
+          uci set dhcp.@host[-1].name="printer"
+          uci set dhcp.@host[-1].mac="aa:bb:cc:11:22:11"
+          uci set dhcp.@host[-1].ip="192.168.1.30"
+          uci commit dhcp
+
+          uci -q get sqm.eth1 >/dev/null || uci set sqm.eth1=queue
+          uci set sqm.eth1.enabled=1
+          uci set sqm.eth1.interface=br-wan
+          uci set sqm.eth1.download=95000
+          uci set sqm.eth1.upload=20000
+          uci set sqm.eth1.qdisc=cake
+          uci set sqm.eth1.script=piece_of_cake.qos
+          uci set sqm.eth1.linklayer=ethernet
+          uci set sqm.eth1.overhead=18
+          uci commit sqm
