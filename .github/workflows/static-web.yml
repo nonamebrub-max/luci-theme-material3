@@ -304,7 +304,25 @@ jobs:
           done
           EOF
           docker cp keep_eth0.sh owrt:/tmp/keep_eth0.sh
-          docker exec -d owrt sh /tmp/keep_eth0.sh
+          
+          # Đưa eth0 lên trước khi khởi động dịch vụ
+          docker exec owrt sh -c "
+            ip link set dev eth0 up
+            ip addr replace $CIP/$CPF dev eth0
+            ip route replace default via $CGW dev eth0 metric 500
+          "
+          # Giám sát mạng từ Docker runner
+          (
+            while docker inspect -f '{{.State.Running}}' owrt 2>/dev/null | grep -q true; do
+              docker exec owrt sh -c '
+                ip link set dev eth0 up 2>/dev/null
+              ' >/dev/null 2>&1 || true
+          
+              sleep 1
+            done
+          ) &
+          
+          echo "Started eth0 network watchdog"
 
           sleep 10
           docker exec owrt ubus -t 60 wait_for system network.interface || true
