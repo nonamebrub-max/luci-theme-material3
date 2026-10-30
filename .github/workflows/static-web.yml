@@ -28,7 +28,9 @@ jobs:
       - name: Install dependencies & Build SCSS
         run: |
           bun install
-          bun run build
+          mkdir -p dist
+          # Biên dịch thư mục chứa SCSS ra thư mục dist
+          bun x sass styles/ dist/ --no-source-map
 
       - name: Create index.html for preview
         run: |
