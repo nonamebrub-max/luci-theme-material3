@@ -41,6 +41,8 @@ jobs:
           docker run -d --name owrt --privileged -p 8080:80 "$OWRT_IMAGE" /sbin/init
           sleep 8
           docker exec owrt mkdir -p /var/lock /var/run
+          # Image chưa có SSL cho uclient-fetch -> dùng http (gói vẫn được ký bằng usign)
+          docker exec owrt sed -i 's#https://#http://#g' /etc/opkg/distfeeds.conf
           docker exec owrt sh -c 'opkg update && opkg install luci'
 
       - name: Install theme into OpenWrt
