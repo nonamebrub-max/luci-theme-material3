@@ -305,24 +305,8 @@ jobs:
           EOF
           docker cp keep_eth0.sh owrt:/tmp/keep_eth0.sh
           
-          # Đưa eth0 lên trước khi khởi động dịch vụ
-          docker exec owrt sh -c "
-            ip link set dev eth0 up
-            ip addr replace $CIP/$CPF dev eth0
-            ip route replace default via $CGW dev eth0 metric 500
-          "
-          # Giám sát mạng từ Docker runner
-          (
-            while docker inspect -f '{{.State.Running}}' owrt 2>/dev/null | grep -q true; do
-              docker exec owrt sh -c '
-                ip link set dev eth0 up 2>/dev/null
-              ' >/dev/null 2>&1 || true
-          
-              sleep 1
-            done
-          ) &
-          
-          echo "Started eth0 network watchdog"
+          # Thực thi script giữ IP ngầm trong container thay vì chạy vòng lặp ngoài host
+          docker exec -d owrt sh /tmp/keep_eth0.sh
 
           sleep 10
           docker exec owrt ubus -t 60 wait_for system network.interface || true
@@ -842,13 +826,13 @@ jobs:
             echo "=== trạng thái các bước ==="
             echo "prep: ${{ steps.prep.outcome }}"
             echo "boot: ${{ steps.boot.outcome }}"
-            echo "=== ps ===";           docker exec owrt ps
-            echo "=== ip addr ===";      docker exec owrt ip addr
-            echo "=== lan status ===";   docker exec owrt ubus call network.interface.lan status
-            echo "=== templates ===";    docker exec owrt ls /usr/share/ucode/luci/template/themes/
-            echo "=== http ===";         curl -is -m 10 http://127.0.0.1:8080/cgi-bin/luci/ | head -n 30
-            echo "=== logread ===";      docker exec owrt logread | tail -n 80
-            echo "=== docker logs ===";  docker logs owrt 2>&1 | tail -n 60
+            echo "=== ps ===";            docker exec owrt ps
+            echo "=== ip addr ===";       docker exec owrt ip addr
+            echo "=== lan status ===";    docker exec owrt ubus call network.interface.lan status
+            echo "=== templates ===";     docker exec owrt ls /usr/share/ucode/luci/template/themes/
+            echo "=== http ===";          curl -is -m 10 http://127.0.0.1:8080/cgi-bin/luci/ | head -n 30
+            echo "=== logread ===";       docker exec owrt logread | tail -n 80
+            echo "=== docker logs ===";   docker logs owrt 2>&1 | tail -n 60
           } > dist/diagnostics.txt 2>&1 || true
           cat dist/diagnostics.txt
 
