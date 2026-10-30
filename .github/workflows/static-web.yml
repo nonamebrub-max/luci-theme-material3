@@ -28,111 +28,39 @@ jobs:
       - name: Install dependencies & Compile SCSS
         run: |
           npm install
-          mkdir -p dist/luci-static/resources/css
-          # Biên dịch toàn bộ file SCSS từ thư mục styles ra CSS
-          npx sass styles/ dist/luci-static/resources/css/ --no-source-map || true
+          mkdir -p dist/luci-static/material3
+          # Biên dịch đúng file cascade.scss ra cascade.css
+          npx sass styles/cascade.scss dist/luci-static/material3/cascade.css --no-source-map
 
-      - name: Copy static assets
+      - name: Copy full htdocs assets
         run: |
           if [ -d "htdocs" ]; then
             cp -r htdocs/* dist/
           fi
 
-      - name: Generate full LuCI Material 3 Preview Index
+      - name: Generate Index Preview Page
         run: |
           cat << 'EOF' > dist/index.html
           <!DOCTYPE html>
-          <html lang="en" dir="ltr" data-layout="top" data-theme="light">
+          <html lang="en" data-theme="light">
           <head>
           <meta charset="utf-8">
-          <title>luci-theme-material3 | Dashboard Preview</title>
+          <title>luci-theme-material3 Preview</title>
           <meta name="viewport" content="width=device-width, initial-scale=1">
-          <link rel="stylesheet" href="./luci-static/resources/css/style.css">
+          <link rel="stylesheet" href="./luci-static/material3/cascade.css">
           <style>
-            :root { 
-              --md-sys-color-primary: #6750A4; 
-              --md-sys-color-surface: #FEF7FF; 
-              --md-sys-color-on-surface: #1d1b20;
-            }
-            body { 
-              font-family: system-ui, -apple-system, sans-serif; 
-              background: #f0f2f5; 
-              margin: 0; 
-              padding: 0; 
-              display: flex; 
-              justify-content: center; 
-              align-items: center; 
-              min-height: 100vh; 
-            }
-            .login-card { 
-              background: var(--md-sys-color-surface, #fff); 
-              padding: 40px; 
-              border-radius: 16px; 
-              box-shadow: 0 4px 20px rgba(0,0,0,0.08); 
-              width: 100%; 
-              max-width: 380px; 
-              box-sizing: border-box; 
-            }
-            .login-title { 
-              font-size: 1.5rem; 
-              font-weight: 600; 
-              margin-bottom: 24px; 
-              text-align: center; 
-              color: var(--md-sys-color-on-surface); 
-            }
-            .form-group { margin-bottom: 16px; }
-            .form-label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 6px; color: #49454f; }
-            .form-input { 
-              width: 100%; 
-              padding: 12px 16px; 
-              border: 1px solid #79747e; 
-              border-radius: 8px; 
-              font-size: 1rem; 
-              box-sizing: border-box; 
-              outline: none; 
-              transition: border-color 0.2s; 
-            }
-            .form-input:focus { border-color: var(--md-sys-color-primary); border-width: 2px; }
-            .btn-login { 
-              width: 100%; 
-              background: var(--md-sys-color-primary); 
-              color: white; 
-              border: none; 
-              padding: 12px; 
-              border-radius: 8px; 
-              font-size: 1rem; 
-              font-weight: 600; 
-              cursor: pointer; 
-              margin-top: 8px; 
-            }
-            .banner { 
-              position: fixed; 
-              top: 0; 
-              left: 0; 
-              right: 0; 
-              background: #1f1f1f; 
-              color: #fff; 
-              text-align: center; 
-              padding: 8px; 
-              font-size: 12px; 
-              z-index: 1000; 
-            }
+            body { font-family: sans-serif; background: #fdf8ff; margin: 0; padding: 40px; display: flex; justify-content: center; align-items: center; min-height: 100vh; box-sizing: border-box; }
+            .preview-card { background: #fff; padding: 32px; border-radius: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.06); width: 100%; max-width: 400px; }
+            h2 { margin-top: 0; color: #6750A4; }
+            .btn { background: #6750A4; color: #fff; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; width: 100%; font-weight: 600; margin-top: 12px; }
           </style>
           </head>
           <body>
-          <div class="banner">LuCI Material 3 - Standalone Web Preview (GitHub Actions)</div>
-          <form class="login-card" onsubmit="event.preventDefault(); alert('Login successful mockup!');">
-              <div class="login-title">OpenWrt Material 3</div>
-              <div class="form-group">
-                  <label class="form-label">Username</label>
-                  <input class="form-input" type="text" value="root" autocomplete="username">
-              </div>
-              <div class="form-group">
-                  <label class="form-label">Password</label>
-                  <input class="form-input" type="password" autofocus autocomplete="current-password">
-              </div>
-              <button type="submit" class="btn-login">Log in</button>
-          </form>
+          <div class="preview-card">
+              <h2>Material 3 Theme</h2>
+              <p>Biên dịch thành công từ <code>styles/cascade.scss</code>!</p>
+              <button class="btn" onclick="alert('Material 3 Active!')">Test Style</button>
+          </div>
           </body>
           </html>
           EOF
