@@ -16,6 +16,7 @@ concurrency:
 
 env:
   OWRT_IMAGE: openwrt/rootfs:x86-64-openwrt-24.10
+  # Đã dọn sạch SQM
   EXTRA_PKGS: luci-app-upnp luci-app-ddns luci-app-wol
   FAIL_ON_ERROR: 'false'
 
@@ -182,7 +183,7 @@ jobs:
           docker cp ucode/template/themes/material3 prep:/usr/share/ucode/luci/template/themes/
           docker cp root/. prep:/ || true
 
-          # Gán eth0 vào LAN để OpenWrt nhận diện chuẩn DHCP/Static từ Docker
+          # Cấu hình mạng: khai báo tĩnh eth0 để netifd giữ IP, kèm giả lập LAN và WAN
           cat > network.conf <<'END_NET'
           config interface 'loopback'
               option device 'lo'
@@ -193,14 +194,29 @@ jobs:
           config globals 'globals'
               option ula_prefix 'fd12:3456:789a::/48'
 
-          config interface 'lan'
+          config interface 'docker'
               option device 'eth0'
-              option proto 'dhcp'
+              option proto 'static'
+              option ipaddr '172.17.0.2'
+              option netmask '255.255.0.0'
+              option gateway '172.17.0.1'
+
+          config device
+              option name 'br-lan'
+              option type 'bridge'
+              option bridge_empty '1'
 
           config device
               option name 'br-wan'
               option type 'bridge'
               option bridge_empty '1'
+
+          config interface 'lan'
+              option device 'br-lan'
+              option proto 'static'
+              option ipaddr '192.168.1.1'
+              option netmask '255.255.255.0'
+              option ip6assign '60'
 
           config interface 'wan'
               option device 'br-wan'
@@ -226,7 +242,7 @@ jobs:
 
           cat > board.json <<'END_BOARD'
           {"model":{"id":"material3,demo","name":"Material3 Demo Router"},
-           "network":{"lan":{"device":"eth0","protocol":"dhcp"},
+           "network":{"lan":{"device":"br-lan","protocol":"static"},
                       "wan":{"device":"br-wan","protocol":"static"}}}
           END_BOARD
           docker cp board.json prep:/etc/board.json
@@ -238,16 +254,20 @@ jobs:
           uci set luci.main.mediaurlbase=/luci-static/material3
           uci commit luci
 
-          # Cấu hình uhttpd bind mọi interface
+          # Tắt ép HTTPS để tránh lỗi chứng chỉ khi chụp
+          uci set uhttpd.main.redirect_https='0'
           uci -q delete uhttpd.main.listen_http
           uci add_list uhttpd.main.listen_http='0.0.0.0:80'
-          uci add_list uhttpd.main.listen_http='[::]:80'
           uci commit uhttpd
 
           uci add dhcp host
           uci set dhcp.@host[-1].name="nas"
           uci set dhcp.@host[-1].mac="aa:bb:cc:11:22:10"
           uci set dhcp.@host[-1].ip="192.168.1.20"
+          uci add dhcp host
+          uci set dhcp.@host[-1].name="printer"
+          uci set dhcp.@host[-1].mac="aa:bb:cc:11:22:11"
+          uci set dhcp.@host[-1].ip="192.168.1.30"
           uci commit dhcp
 
           /etc/init.d/firewall disable
@@ -261,20 +281,32 @@ jobs:
           docker commit prep owrt-prepared
           docker rm -f prep
 
-      # ---------- Boot OpenWrt & Test trực tiếp bằng Container IP ----------
+      # ---------- Boot thật bằng procd ----------
       - name: Boot OpenWrt
         id: boot
         if: steps.prep.outcome == 'success'
         continue-on-error: true
         run: |
-          docker run -d --name owrt --privileged owrt-prepared /sbin/init
+          docker run -d --name owrt --privileged -p 8080:80 owrt-prepared /sbin/init
 
           CIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' owrt)
-          echo "OWRT_IP=$CIP" >> $GITHUB_ENV
-          echo "Container IP: $CIP"
+          CGW=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' owrt)
+          echo "container eth0: $CIP/16 via $CGW"
 
-          sleep 5
+          # Chờ procd khởi động các dịch vụ
+          sleep 6
           docker exec owrt ubus -t 30 wait_for system || true
+
+          # Ghi đè chính xác IP thực tế vào UCI để netifd bảo vệ interface eth0
+          docker exec owrt sh -c "
+            uci set network.docker.ipaddr='$CIP'
+            uci set network.docker.gateway='$CGW'
+            uci commit network
+            ip link set dev eth0 up
+            ip addr replace $CIP/16 dev eth0
+            ip route replace default via $CGW dev eth0
+          "
+
           docker exec owrt /etc/init.d/rpcd restart || true
           docker exec owrt /etc/init.d/uhttpd restart || true
           sleep 2
@@ -284,29 +316,33 @@ jobs:
           cat > dhcp.leases <<EOF
           $exp aa:bb:cc:11:22:01 192.168.1.101 pixel-8 *
           $exp aa:bb:cc:11:22:02 192.168.1.102 macbook-pro *
+          $exp aa:bb:cc:11:22:03 192.168.1.103 smart-tv *
           $exp aa:bb:cc:11:22:10 192.168.1.20 nas *
           EOF
           docker cp dhcp.leases owrt:/tmp/dhcp.leases
 
-          # Gọi thẳng IP container, dẹp bỏ hoàn toàn trung gian port mapping
+          # Kiểm tra kết nối
           for i in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$CIP/cgi-bin/luci/" || true)
-            echo "try $i (http://$CIP): HTTP $code"
+            code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://127.0.0.1:8080/cgi-bin/luci/ || true)
+            echo "try $i: HTTP $code"
             case "$code" in
               200|302|403) echo "LuCI up thành công!"; exit 0 ;;
             esac
             sleep 2
           done
 
-          echo "=== Thông tin chẩn đoán khi fail ==="
-          docker exec owrt ps
-          docker exec owrt ip addr
-          docker exec owrt netstat -ltn
-          docker exec owrt logread | tail -n 40
+          echo "=== eth0 trong container ==="
+          docker exec owrt ip addr show eth0 || true
+          echo "=== test nội bộ container ==="
+          docker exec owrt wget -qO- http://127.0.0.1/cgi-bin/luci/ | head -n 5 || true
+          echo "=== listening ports ==="
+          docker exec owrt netstat -ltn || true
+          echo "=== logread ==="
+          docker exec owrt logread | tail -n 40 || true
           echo "::error::LuCI không lên"
           exit 1
 
-      # ---------- Runtime checks ----------
+      # ---------- Kiểm tra trên router ----------
       - name: Runtime checks
         if: steps.boot.outcome == 'success'
         continue-on-error: true
@@ -314,7 +350,7 @@ jobs:
           set +e
           source checks/lib.sh
           echo "## Kiểm tra trên OpenWrt" >> "$GITHUB_STEP_SUMMARY"
-          U="http://$OWRT_IP"
+          U=http://127.0.0.1:8080
           ex() { docker exec owrt "$@"; }
 
           ok "$(ex sh -c '. /etc/openwrt_release; echo $DISTRIB_DESCRIPTION')"
@@ -327,6 +363,9 @@ jobs:
           for o in luci luci-rpc system network.interface session uci file; do
             if echo "$objs" | grep -qx "$o"; then ok "ubus có object $o"; else fail "ubus thiếu object $o"; fi
           done
+
+          if ex ubus call network.interface.lan status | grep -q '"up": true'; then ok "Interface lan đang up"; else warn "Interface lan không up"; fi
+          if ex ubus call network.interface.wan status | grep -q '"up": true'; then ok "Interface wan đang up"; else warn "Interface wan không up"; fi
 
           mb=$(ex uci -q get luci.main.mediaurlbase)
           if [ "$mb" = "/luci-static/material3" ]; then ok "Theme mặc định là material3"; else fail "mediaurlbase = '$mb'"; fi
@@ -350,12 +389,23 @@ jobs:
           done < <(find htdocs -type f)
           if [ "$bad" -eq 0 ]; then ok "Web server phục vụ đủ $cnt file tĩnh (HTTP 200)"; fi
 
+          ct=$(curl -sI -m 10 "$U/luci-static/material3/cascade.css" | tr -d '\r' | grep -i '^content-type')
+          case "$ct" in
+            *text/css*) ok "cascade.css đúng content-type" ;;
+            *) warn "cascade.css content-type lạ: $ct" ;;
+          esac
+
           html=$(curl -s -m 15 "$U/cgi-bin/luci/")
           if [ -n "$html" ]; then ok "Trang đăng nhập có nội dung"; else fail "Trang đăng nhập rỗng"; fi
           if echo "$html" | grep -q 'material3'; then ok "HTML đăng nhập nhắc tới material3"; else fail "HTML đăng nhập không dùng theme material3"; fi
           if echo "$html" | grep -q 'cascade.css'; then ok "HTML đăng nhập nạp cascade.css"; else fail "HTML đăng nhập không nạp cascade.css"; fi
+          if echo "$html" | grep -Eq '\{%|\{\{'; then fail "HTML đăng nhập còn cú pháp ucode chưa render"; else ok "HTML đăng nhập không còn {% %} / {{ }}"; fi
+          if echo "$html" | grep -Eiq 'Failed to (load|compile)|Syntax error|Reference error|Unable to compile|Runtime error'; then fail "Trang đăng nhập báo lỗi template/ucode"; else ok "Trang đăng nhập không báo lỗi template"; fi
 
-      # ---------- Playwright Capture ----------
+          errs=$(ex logread | grep -Ei 'ucode|luci|uhttpd|rpcd' | grep -Ei 'error|fail|exception' | head -n 5)
+          if [ -n "$errs" ]; then warn "logread có dòng lỗi liên quan LuCI: $(echo "$errs" | head -n 2 | tr '\n' ' ')"; else ok "logread không có lỗi liên quan LuCI"; fi
+
+      # ---------- Chụp + kiểm tra từng trang ----------
       - name: Install Playwright and sharp
         if: steps.boot.outcome == 'success'
         continue-on-error: true
@@ -368,12 +418,12 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p dist/shots
-          cat > capture.mjs <<EOF
+          cat > capture.mjs <<'END_CAPTURE'
           import { chromium } from 'playwright';
           import sharp from 'sharp';
           import fs from 'node:fs';
 
-          const ORIGIN = 'http://${OWRT_IP}';
+          const ORIGIN = 'http://127.0.0.1:8080';
           const BASE = ORIGIN + '/cgi-bin/luci';
           const MAX_H = 12000;
 
@@ -585,7 +635,7 @@ jobs:
             if (warns.length) md += '\n### Cảnh báo\n' + warns.slice(0, 60).map(w => '- ⚠️ `' + w.k + '` — ' + w.where).join('\n') + '\n';
             fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
           }
-          EOF
+          END_CAPTURE
           node capture.mjs
 
       # ---------- Album UI ----------
@@ -773,7 +823,7 @@ jobs:
             echo "=== ip addr ===";       docker exec owrt ip addr
             echo "=== lan status ===";    docker exec owrt ubus call network.interface.lan status
             echo "=== templates ===";     docker exec owrt ls /usr/share/ucode/luci/template/themes/
-            echo "=== http ===";          curl -is -m 10 "http://$OWRT_IP/cgi-bin/luci/" | head -n 30
+            echo "=== http ===";          curl -is -m 10 http://127.0.0.1:8080/cgi-bin/luci/ | head -n 30
             echo "=== logread ===";       docker exec owrt logread | tail -n 80
             echo "=== docker logs ===";   docker logs owrt 2>&1 | tail -n 60
           } > dist/diagnostics.txt 2>&1 || true
