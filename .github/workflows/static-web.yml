@@ -29,7 +29,6 @@ jobs:
         run: |
           npm install
           mkdir -p dist/luci-static/material3
-          # Biên dịch đúng file cascade.scss ra cascade.css
           npx sass styles/cascade.scss dist/luci-static/material3/cascade.css --no-source-map
 
       - name: Copy full htdocs assets
@@ -38,32 +37,22 @@ jobs:
             cp -r htdocs/* dist/
           fi
 
-      - name: Generate Index Preview Page
+      - name: Process original ucode template to HTML
         run: |
-          cat << 'EOF' > dist/index.html
-          <!DOCTYPE html>
-          <html lang="en" data-theme="light">
-          <head>
-          <meta charset="utf-8">
-          <title>luci-theme-material3 Preview</title>
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <link rel="stylesheet" href="./luci-static/material3/cascade.css">
-          <style>
-            body { font-family: sans-serif; background: #fdf8ff; margin: 0; padding: 40px; display: flex; justify-content: center; align-items: center; min-height: 100vh; box-sizing: border-box; }
-            .preview-card { background: #fff; padding: 32px; border-radius: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.06); width: 100%; max-width: 400px; }
-            h2 { margin-top: 0; color: #6750A4; }
-            .btn { background: #6750A4; color: #fff; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; width: 100%; font-weight: 600; margin-top: 12px; }
-          </style>
-          </head>
-          <body>
-          <div class="preview-card">
-              <h2>Material 3 Theme</h2>
-              <p>Biên dịch thành công từ <code>styles/cascade.scss</code>!</p>
-              <button class="btn" onclick="alert('Material 3 Active!')">Test Style</button>
-          </div>
-          </body>
-          </html>
-          EOF
+          # Copy file template đăng nhập gốc
+          if [ -f "ucode/template/themes/material3/sysauth.ut" ]; then
+            cp ucode/template/themes/material3/sysauth.ut dist/index.html
+            
+            # Thay thế các biến/cú pháp ucode động thành giá trị tĩnh để trình duyệt render được trực tiếp
+            sed -i 's/{{ pcdata(striptags(boardinfo.hostname)) }}/footstrap-playground/g' dist/index.html
+            sed -i 's/{{ media }}/.\/luci-static\/material3/g' dist/index.html
+            sed -i 's/{{ resource }}/.\/luci-static\/resources/g' dist/index.html
+            sed -i 's/{% if (FSM_URL) { %}/ /g' dist/index.html
+            sed -i 's/{% } %}/ /g' dist/index.html
+          else
+            echo "Template not found!" >&2
+            exit 1
+          fi
 
       - name: Upload artifact for GitHub Pages
         uses: actions/upload-pages-artifact@v3
