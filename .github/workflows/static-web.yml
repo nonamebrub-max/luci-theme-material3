@@ -1,8 +1,9 @@
-name: Build and Deploy LuCI Theme M3
+name: Deploy static preview
 
 on:
   push:
-    branches: ["main"]
+    branches: [main, master]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -10,61 +11,138 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages"
+  group: pages
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install dependencies & Compile SCSS
+      - name: Install dependencies
         run: |
           npm install
+          npx --no-install sass --version || npm install --no-save sass
+
+      - name: Copy static assets to dist
+        run: |
+          rm -rf dist
           mkdir -p dist/luci-static/material3
+          cp -r htdocs/* dist/
+
+      - name: Build SCSS
+        run: |
           npx sass styles/cascade.scss dist/luci-static/material3/cascade.css --no-source-map
+          # Chuyển đường dẫn tuyệt đối (font, ảnh) sang tương đối để chạy được ở /<repo>/
+          sed -i \
+            -e 's#url(/luci-static/#url(../#g' \
+            -e 's#url("/luci-static/#url("../#g' \
+            -e "s#url('/luci-static/#url('../#g" \
+            dist/luci-static/material3/cascade.css
 
-      - name: Copy full htdocs assets
+      - name: Generate index.html
         run: |
-          if [ -d "htdocs" ]; then
-            cp -r htdocs/* dist/
-          fi
-
-      - name: Process original ucode template to HTML
-        run: |
-          # Copy file template đăng nhập gốc
-          if [ -f "ucode/template/themes/material3/sysauth.ut" ]; then
-            cp ucode/template/themes/material3/sysauth.ut dist/index.html
-            
-            # Thay thế các biến/cú pháp ucode động thành giá trị tĩnh để trình duyệt render được trực tiếp
-            sed -i 's/{{ pcdata(striptags(boardinfo.hostname)) }}/footstrap-playground/g' dist/index.html
-            sed -i 's/{{ media }}/.\/luci-static\/material3/g' dist/index.html
-            sed -i 's/{{ resource }}/.\/luci-static\/resources/g' dist/index.html
-            sed -i 's/{% if (FSM_URL) { %}/ /g' dist/index.html
-            sed -i 's/{% } %}/ /g' dist/index.html
+          RIPPLE_FILE=$(find dist -type f -name 'ripple.js' | head -n1 || true)
+          if [ -n "$RIPPLE_FILE" ]; then
+            RIPPLE_TAG="<script src=\"${RIPPLE_FILE#dist/}\" defer></script>"
           else
-            echo "Template not found!" >&2
-            exit 1
+            echo "::warning::Không tìm thấy ripple.js, bỏ qua"
+            RIPPLE_TAG=""
           fi
 
-      - name: Upload artifact for GitHub Pages
+          cat > dist/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html lang="vi" data-darkmode="false">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <meta name="theme-color" content="#6750a4">
+            <title>OpenWrt - LuCI Material 3 Preview</title>
+            <link rel="stylesheet" href="luci-static/material3/cascade.css">
+          </head>
+          <body class="lang_en" data-page="admin-login">
+            <div id="maincontent" class="container">
+              <form method="post" class="cbi-map" onsubmit="return false;">
+                <div class="cbi-section">
+                  <h2>Authorization Required</h2>
+                  <p>Please enter your username and password.</p>
+                  <div class="cbi-value">
+                    <label class="cbi-value-title" for="luci_username">Username</label>
+                    <div class="cbi-value-field">
+                      <input class="cbi-input-user" type="text" id="luci_username" name="luci_username" value="root" autocomplete="username">
+                    </div>
+                  </div>
+                  <div class="cbi-value">
+                    <label class="cbi-value-title" for="luci_password">Password</label>
+                    <div class="cbi-value-field">
+                      <input class="cbi-input-password" type="password" id="luci_password" name="luci_password" autocomplete="current-password">
+                    </div>
+                  </div>
+                </div>
+                <div class="cbi-page-actions">
+                  <button type="submit" class="btn cbi-button cbi-button-positive important">Login</button>
+                  <button type="reset" class="btn cbi-button cbi-button-reset">Reset</button>
+                </div>
+              </form>
+            </div>
+            <footer><span>Static preview of luci-theme-material3</span></footer>
+            <script>
+              window.L = window.L || {
+                env: { resource: 'luci-static/resources', media: 'luci-static/material3' },
+                resource: function (p) { return 'luci-static/resources/' + p; },
+                resolveDefault: function (p) { return Promise.resolve(p); },
+                ready: function (cb) {
+                  if (document.readyState !== 'loading') cb();
+                  else document.addEventListener('DOMContentLoaded', cb);
+                }
+              };
+            </script>
+            __RIPPLE__
+          </body>
+          </html>
+          HTML
+
+          # Bỏ thụt đầu dòng do YAML, rồi chèn thẻ script ripple
+          sed -i 's/^          //' dist/index.html
+          sed -i "s#__RIPPLE__#${RIPPLE_TAG}#" dist/index.html
+          touch dist/.nojekyll
+
+      - name: Sanity check
+        run: |
+          set -e
+          test -s dist/luci-static/material3/cascade.css
+          test -f dist/index.html
+          if grep -nE '\{\{|\{%' dist/index.html; then
+            echo "::error::index.html còn cú pháp ucode"; exit 1
+          fi
+          grep -oE '(href|src)="luci-static/[^"]+"' dist/index.html \
+            | sed -E 's/^(href|src)="//; s/"$//' \
+            | while read -r f; do
+                test -f "dist/$f" || { echo "::error::Thiếu file: $f"; exit 1; }
+              done
+          echo "OK"
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './dist'
+          path: dist
 
   deploy:
+    needs: build
+    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: build
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
