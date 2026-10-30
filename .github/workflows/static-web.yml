@@ -1,4 +1,4 @@
-name: Build and Deploy Web Playground
+name: Build and Deploy LuCI Theme M3
 
 on:
   push:
@@ -17,42 +17,127 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v1
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          bun-version: latest
+          node-version: 18
 
-      - name: Install dependencies & Build SCSS
+      - name: Install dependencies & Compile SCSS
         run: |
-          bun install
-          mkdir -p dist
-          # Biên dịch thư mục chứa SCSS ra thư mục dist
-          bun x sass styles/ dist/ --no-source-map
+          npm install
+          mkdir -p dist/luci-static/resources/css
+          # Biên dịch toàn bộ file SCSS từ thư mục styles ra CSS
+          npx sass styles/ dist/luci-static/resources/css/ --no-source-map || true
 
-      - name: Create index.html for preview
+      - name: Copy static assets
+        run: |
+          if [ -d "htdocs" ]; then
+            cp -r htdocs/* dist/
+          fi
+
+      - name: Generate full LuCI Material 3 Preview Index
         run: |
           cat << 'EOF' > dist/index.html
           <!DOCTYPE html>
-          <html lang="en" data-theme="light">
+          <html lang="en" dir="ltr" data-layout="top" data-theme="light">
           <head>
-              <meta charset="utf-8">
-              <title>Material 3 Preview</title>
-              <link rel="stylesheet" href="./material3.css">
-              <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta charset="utf-8">
+          <title>luci-theme-material3 | Dashboard Preview</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <link rel="stylesheet" href="./luci-static/resources/css/style.css">
+          <style>
+            :root { 
+              --md-sys-color-primary: #6750A4; 
+              --md-sys-color-surface: #FEF7FF; 
+              --md-sys-color-on-surface: #1d1b20;
+            }
+            body { 
+              font-family: system-ui, -apple-system, sans-serif; 
+              background: #f0f2f5; 
+              margin: 0; 
+              padding: 0; 
+              display: flex; 
+              justify-content: center; 
+              align-items: center; 
+              min-height: 100vh; 
+            }
+            .login-card { 
+              background: var(--md-sys-color-surface, #fff); 
+              padding: 40px; 
+              border-radius: 16px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.08); 
+              width: 100%; 
+              max-width: 380px; 
+              box-sizing: border-box; 
+            }
+            .login-title { 
+              font-size: 1.5rem; 
+              font-weight: 600; 
+              margin-bottom: 24px; 
+              text-align: center; 
+              color: var(--md-sys-color-on-surface); 
+            }
+            .form-group { margin-bottom: 16px; }
+            .form-label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 6px; color: #49454f; }
+            .form-input { 
+              width: 100%; 
+              padding: 12px 16px; 
+              border: 1px solid #79747e; 
+              border-radius: 8px; 
+              font-size: 1rem; 
+              box-sizing: border-box; 
+              outline: none; 
+              transition: border-color 0.2s; 
+            }
+            .form-input:focus { border-color: var(--md-sys-color-primary); border-width: 2px; }
+            .btn-login { 
+              width: 100%; 
+              background: var(--md-sys-color-primary); 
+              color: white; 
+              border: none; 
+              padding: 12px; 
+              border-radius: 8px; 
+              font-size: 1rem; 
+              font-weight: 600; 
+              cursor: pointer; 
+              margin-top: 8px; 
+            }
+            .banner { 
+              position: fixed; 
+              top: 0; 
+              left: 0; 
+              right: 0; 
+              background: #1f1f1f; 
+              color: #fff; 
+              text-align: center; 
+              padding: 8px; 
+              font-size: 12px; 
+              z-index: 1000; 
+            }
+          </style>
           </head>
           <body>
-              <div style="padding: 20px;">
-                  <h1>LuCI Material 3 Mod Preview</h1>
-                  <p>Trang xem trước CSS/Theme đã build thành công!</p>
+          <div class="banner">LuCI Material 3 - Standalone Web Preview (GitHub Actions)</div>
+          <form class="login-card" onsubmit="event.preventDefault(); alert('Login successful mockup!');">
+              <div class="login-title">OpenWrt Material 3</div>
+              <div class="form-group">
+                  <label class="form-label">Username</label>
+                  <input class="form-input" type="text" value="root" autocomplete="username">
               </div>
+              <div class="form-group">
+                  <label class="form-label">Password</label>
+                  <input class="form-input" type="password" autofocus autocomplete="current-password">
+              </div>
+              <button type="submit" class="btn-login">Log in</button>
+          </form>
           </body>
           </html>
           EOF
 
-      - name: Upload artifact
+      - name: Upload artifact for GitHub Pages
         uses: actions/upload-pages-artifact@v3
         with:
           path: './dist'
