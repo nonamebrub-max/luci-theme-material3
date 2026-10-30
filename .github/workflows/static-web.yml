@@ -16,9 +16,8 @@ concurrency:
 
 env:
   OWRT_IMAGE: openwrt/rootfs:x86-64-openwrt-24.10
-  # App LuCI muốn cài và chụp (cách nhau bằng dấu cách)
-  EXTRA_PKGS: luci-app-sqm luci-app-upnp luci-app-ddns luci-app-wol
-  # true = job đỏ nếu có lỗi mức "error" (vẫn deploy trước khi báo đỏ)
+  # Đã gỡ luci-app-sqm
+  EXTRA_PKGS: luci-app-upnp luci-app-ddns luci-app-wol
   FAIL_ON_ERROR: 'false'
 
 jobs:
@@ -262,17 +261,6 @@ jobs:
           uci set dhcp.@host[-1].ip="192.168.1.30"
           uci commit dhcp
 
-          uci -q get sqm.eth1 >/dev/null || uci set sqm.eth1=queue
-          uci set sqm.eth1.enabled=1
-          uci set sqm.eth1.interface=br-wan
-          uci set sqm.eth1.download=95000
-          uci set sqm.eth1.upload=20000
-          uci set sqm.eth1.qdisc=cake
-          uci set sqm.eth1.script=piece_of_cake.qos
-          uci set sqm.eth1.linklayer=ethernet
-          uci set sqm.eth1.overhead=18
-          uci commit sqm
-
           /etc/init.d/firewall disable
           /etc/init.d/rpcd enable
           /etc/init.d/uhttpd enable
@@ -290,7 +278,6 @@ jobs:
         if: steps.prep.outcome == 'success'
         continue-on-error: true
         run: |
-          # eth0 giờ đã là 'unmanaged', OpenWrt sẽ không xóa IP của nó nữa
           docker run -d --name owrt --privileged -p 8080:80 owrt-prepared /sbin/init
 
           sleep 10
@@ -308,7 +295,6 @@ jobs:
           $exp aa:bb:cc:11:22:10 192.168.1.20 nas *
           EOF
           docker cp dhcp.leases owrt:/tmp/dhcp.leases
-          docker exec owrt /etc/init.d/sqm restart || true
 
           for i in $(seq 1 40); do
             code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8080/cgi-bin/luci/ || true)
@@ -364,9 +350,6 @@ jobs:
           for p in luci $EXTRA_PKGS; do
             if ex opkg list-installed | grep -q "^$p "; then ok "Đã cài $p"; else warn "Chưa cài được $p"; fi
           done
-
-          if ex tc qdisc show dev br-wan | grep -q cake; then ok "SQM: qdisc cake đang chạy trên br-wan"; else warn "SQM: không thấy qdisc cake (kernel runner có thể thiếu sch_cake)"; fi
-          if ex uci -q get sqm.eth1.enabled | grep -q 1; then ok "SQM được bật trong cấu hình"; else warn "SQM chưa bật"; fi
 
           if ex ubus call luci-rpc getDHCPLeases | grep -q pixel-8; then ok "DHCP lease giả lập hiển thị qua luci-rpc"; else warn "Không thấy DHCP lease giả lập"; fi
 
@@ -425,7 +408,7 @@ jobs:
             ['processes',   'Processes',       'Status',   '/admin/status/processes'],
             ['realtime',    'Realtime Graphs', 'Status',   '/admin/status/realtime'],
             ['interfaces',  'Interfaces',      'Network',  '/admin/network/network'],
-            ['iface-modal', 'Edit interface (modal)', 'Network', '/admin/network/network',
+            ['iface-modal', 'Edit interface',  'Network', '/admin/network/network',
               async (p) => {
                 await p.locator('.cbi-button-edit').first().click();
                 await p.waitForSelector('.modal', { timeout: 8000 });
@@ -433,7 +416,6 @@ jobs:
               }],
             ['dhcp',        'DHCP and DNS',    'Network',  '/admin/network/dhcp'],
             ['firewall',    'Firewall',        'Network',  '/admin/network/firewall'],
-            ['sqm',         'SQM QoS',         'Network',  '/admin/network/sqm'],
             ['diagnostics', 'Diagnostics',     'Network',  '/admin/network/diagnostics'],
             ['system',      'System',          'System',   '/admin/system/system'],
             ['admin',       'Administration',  'System',   '/admin/system/admin'],
