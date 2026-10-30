@@ -102,6 +102,17 @@ jobs:
           EOF
           docker cp board.json prep:/etc/board.json
 
+                    cat > system.conf <<'EOF'
+          config system
+              option hostname 'Material3-Router'
+              option timezone '<+07>-7'
+              option zonename 'Asia/Ho Chi Minh'
+              option ttylogin '0'
+              option log_size '64'
+              option urandom_seed '0'
+          EOF
+          docker cp system.conf prep:/etc/config/system
+
           docker exec prep sh -c '
             set -x
             printf "root\nroot\n" | passwd root
