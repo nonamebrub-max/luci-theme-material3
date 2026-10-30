@@ -16,11 +16,13 @@ concurrency:
 
 env:
   OWRT_IMAGE: openwrt/rootfs:x86-64-openwrt-24.10
+  # Thêm/bớt app LuCI muốn chụp (cách nhau bằng dấu cách)
+  EXTRA_PKGS: luci-app-sqm luci-app-upnp luci-app-ddns luci-app-wol
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -36,144 +38,409 @@ jobs:
           mkdir -p build/luci-static/material3
           npx sass styles/cascade.scss build/luci-static/material3/cascade.css --no-source-map
 
-      - name: Start OpenWrt container and install LuCI
+      # ---------- Chuẩn bị image OpenWrt (mạng Docker còn nguyên) ----------
+      - name: Prepare OpenWrt image
         run: |
-          docker run -d --name owrt -p 8080:80 "$OWRT_IMAGE" sleep infinity
-          docker exec owrt mkdir -p /var/lock /var/run/ubus
-          docker exec owrt cat /etc/resolv.conf
-          docker exec owrt sed -i 's#https://#http://#g' /etc/opkg/distfeeds.conf
-          docker exec owrt sh -c 'opkg update && opkg install luci'
+          docker run -d --name prep "$OWRT_IMAGE" sleep infinity
+          docker exec prep mkdir -p /var/lock /var/run
+          docker exec prep sed -i 's#https://#http://#g' /etc/opkg/distfeeds.conf
+          docker exec prep sh -c 'opkg update && opkg install luci'
+          for p in $EXTRA_PKGS; do
+            docker exec prep opkg install "$p" || echo "::warning::Không cài được $p"
+          done
 
-      - name: Install theme and start LuCI services
-        run: |
-          docker cp htdocs/. owrt:/www/
-          docker cp build/luci-static/material3/cascade.css owrt:/www/luci-static/material3/cascade.css
-          docker exec owrt mkdir -p /usr/share/ucode/luci/template/themes
-          docker cp ucode/template/themes/material3 owrt:/usr/share/ucode/luci/template/themes/
-          docker cp root/. owrt:/ || true
+          # Theme
+          docker cp htdocs/. prep:/www/
+          docker cp build/luci-static/material3/cascade.css prep:/www/luci-static/material3/cascade.css
+          docker exec prep mkdir -p /usr/share/ucode/luci/template/themes
+          docker cp ucode/template/themes/material3 prep:/usr/share/ucode/luci/template/themes/
+          docker cp root/. prep:/ || true
 
-          docker exec owrt sh -c '
+          # Config mạng giả lập: 2 bridge rỗng, không đụng eth0 của Docker
+          cat > network.conf <<'EOF'
+          config interface 'loopback'
+              option device 'lo'
+              option proto 'static'
+              option ipaddr '127.0.0.1'
+              option netmask '255.0.0.0'
+
+          config globals 'globals'
+              option ula_prefix 'fd12:3456:789a::/48'
+
+          config device
+              option name 'br-lan'
+              option type 'bridge'
+              option bridge_empty '1'
+
+          config device
+              option name 'br-wan'
+              option type 'bridge'
+              option bridge_empty '1'
+
+          config interface 'lan'
+              option device 'br-lan'
+              option proto 'static'
+              option ipaddr '192.168.1.1'
+              option netmask '255.255.255.0'
+              option ip6assign '60'
+
+          config interface 'wan'
+              option device 'br-wan'
+              option proto 'static'
+              option ipaddr '203.0.113.2'
+              option netmask '255.255.255.0'
+              option gateway '203.0.113.1'
+              list dns '1.1.1.1'
+              list dns '8.8.8.8'
+          EOF
+          docker cp network.conf prep:/etc/config/network
+
+          cat > board.json <<'EOF'
+          {"model":{"id":"material3,demo","name":"Material3 Demo Router"},
+           "network":{"lan":{"device":"br-lan","protocol":"static"},
+                      "wan":{"device":"br-wan","protocol":"static"}}}
+          EOF
+          docker cp board.json prep:/etc/board.json
+
+          docker exec prep sh -c '
+            set -x
+            printf "root\nroot\n" | passwd root
+            # Theme mặc định
             uci set luci.themes.Material3=/luci-static/material3
             uci set luci.main.mediaurlbase=/luci-static/material3
             uci commit luci
-            printf "root\nroot\n" | passwd root
+            # System
+            uci set system.@system[0].hostname="Material3-Router"
+            uci set system.@system[0].zonename="Asia/Ho Chi Minh"
+            uci set system.@system[0].timezone="<+07>-7"
+            uci commit system
+            # DHCP static leases
+            uci add dhcp host; uci set dhcp.@host[-1].name="nas";     uci set dhcp.@host[-1].mac="aa:bb:cc:11:22:10"; uci set dhcp.@host[-1].ip="192.168.1.20"
+            uci add dhcp host; uci set dhcp.@host[-1].name="printer"; uci set dhcp.@host[-1].mac="aa:bb:cc:11:22:11"; uci set dhcp.@host[-1].ip="192.168.1.30"
+            uci commit dhcp
+            # SQM
+            uci -q get sqm.eth1 >/dev/null || uci set sqm.eth1=queue
+            uci set sqm.eth1.enabled=1
+            uci set sqm.eth1.interface=br-wan
+            uci set sqm.eth1.download=95000
+            uci set sqm.eth1.upload=20000
+            uci set sqm.eth1.qdisc=cake
+            uci set sqm.eth1.script=piece_of_cake.qos
+            uci set sqm.eth1.linklayer=ethernet
+            uci set sqm.eth1.overhead=18
+            uci commit sqm
+            # Firewall chặn input trên eth0 của Docker -> tắt auto-start (trang cấu hình vẫn xem được)
+            /etc/init.d/firewall disable
             rm -rf /tmp/luci-*
-          '
+          ' || true
 
-          # Tự bật daemon, không dùng procd/init
-          docker exec -d owrt ubusd -s /var/run/ubus/ubus.sock
-          sleep 2
-          docker exec -d owrt rpcd -s /var/run/ubus/ubus.sock
-          docker exec -d owrt logd
-          sleep 2
-          docker exec -d owrt uhttpd -f -h /www -r OpenWrt -x /cgi-bin \
-            -u /ubus -U /var/run/ubus/ubus.sock \
-            -t 60 -T 30 -k 20 -A 1 -n 3 -N 100 -R -p 0.0.0.0:80
+          docker commit prep owrt-prepared
+          docker rm -f prep
 
-      - name: Wait for LuCI
+      # ---------- Boot thật bằng procd ----------
+      - name: Boot OpenWrt
         run: |
-          for i in $(seq 1 30); do
+          docker run -d --name owrt --privileged -p 8080:80 owrt-prepared /sbin/init
+          sleep 10
+          docker exec owrt ubus -t 60 wait_for system network.interface || true
+
+          now=$(date +%s); exp=$((now + 43200))
+          docker exec -i owrt sh -c 'cat > /tmp/dhcp.leases' <<EOF
+          $exp aa:bb:cc:11:22:01 192.168.1.101 pixel-8 *
+          $exp aa:bb:cc:11:22:02 192.168.1.102 macbook-pro *
+          $exp aa:bb:cc:11:22:03 192.168.1.103 smart-tv *
+          $exp aa:bb:cc:11:22:10 192.168.1.20 nas *
+          EOF
+          docker exec owrt /etc/init.d/sqm restart || true
+
+          for i in $(seq 1 60); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/cgi-bin/luci/ || true)
             echo "try $i: HTTP $code"
-            case "$code" in
-              200|302|403) echo "LuCI up"; exit 0 ;;
-            esac
+            case "$code" in 200|302|403) echo "LuCI up"; exit 0 ;; esac
             sleep 2
           done
-          docker exec owrt ps
-          docker logs owrt | tail -n 50
           echo "::error::LuCI không lên"; exit 1
 
-      - name: Install Playwright
+      # ---------- Chụp ----------
+      - name: Install Playwright and sharp
         run: |
-          npm install --no-save playwright
+          npm install --no-save playwright sharp
           npx playwright install --with-deps chromium
 
       - name: Capture screenshots
         run: |
           mkdir -p dist/shots
-          cat > shots.mjs <<'EOF'
+          cat > capture.mjs <<'EOF'
           import { chromium } from 'playwright';
+          import sharp from 'sharp';
           import fs from 'node:fs';
 
-          const base = 'http://localhost:8080';
-          const pages = [
-            ['status',   '/cgi-bin/luci/admin/status/overview'],
-            ['network',  '/cgi-bin/luci/admin/network/network'],
-            ['wireless', '/cgi-bin/luci/admin/network/wireless'],
-            ['firewall', '/cgi-bin/luci/admin/network/firewall'],
-            ['system',   '/cgi-bin/luci/admin/system/system'],
-            ['syslog',   '/cgi-bin/luci/admin/status/logs'],
+          const BASE = 'http://localhost:8080/cgi-bin/luci';
+          const PAGES = [
+            ['overview',    'Overview',       'Status',   '/admin/status/overview'],
+            ['routes',      'Routing',        'Status',   '/admin/status/routes'],
+            ['syslog',      'System Log',     'Status',   '/admin/status/logs'],
+            ['processes',   'Processes',      'Status',   '/admin/status/processes'],
+            ['realtime',    'Realtime Graphs','Status',   '/admin/status/realtime'],
+            ['interfaces',  'Interfaces',     'Network',  '/admin/network/network'],
+            ['iface-modal', 'Edit interface (modal)', 'Network', '/admin/network/network',
+              async (p) => { await p.locator('.cbi-button-edit').first().click(); await p.waitForSelector('.modal', { timeout: 8000 }); await p.waitForTimeout(800); }],
+            ['dhcp',        'DHCP and DNS',   'Network',  '/admin/network/dhcp'],
+            ['firewall',    'Firewall',       'Network',  '/admin/network/firewall'],
+            ['sqm',         'SQM QoS',        'Network',  '/admin/network/sqm'],
+            ['diagnostics', 'Diagnostics',    'Network',  '/admin/network/diagnostics'],
+            ['system',      'System',         'System',   '/admin/system/system'],
+            ['admin',       'Administration', 'System',   '/admin/system/admin'],
+            ['packages',    'Software',       'System',   '/admin/system/package-manager'],
+            ['startup',     'Startup',        'System',   '/admin/system/startup'],
+            ['flash',       'Backup / Flash', 'System',   '/admin/system/flash'],
+            ['upnp',        'UPnP',           'Services', '/admin/services/upnp'],
+            ['ddns',        'Dynamic DNS',    'Services', '/admin/services/ddns'],
+            ['wol',         'Wake on LAN',    'Services', '/admin/services/wol'],
           ];
-          const viewports = {
-            desktop: { width: 1366, height: 850 },
-            mobile:  { width: 390,  height: 844 },
-          };
-          const schemes = ['light', 'dark'];
+          const DEVICES = { desktop: { width: 1366, height: 850 }, mobile: { width: 390, height: 844 } };
+          const SCHEMES = ['light', 'dark'];
 
           const browser = await chromium.launch();
-          const shots = [];
+          const manifest = [];
 
-          for (const scheme of schemes) {
-            for (const [vpName, viewport] of Object.entries(viewports)) {
-              const ctx = await browser.newContext({ viewport, colorScheme: scheme });
-              const page = await ctx.newPage();
-
-              await page.goto(base + '/cgi-bin/luci/', { waitUntil: 'networkidle' });
-              await page.waitForTimeout(800);
-              const loginFile = `login-${vpName}-${scheme}.png`;
-              await page.screenshot({ path: `dist/shots/${loginFile}` });
-              shots.push({ name: 'login', vpName, scheme, file: loginFile });
-
-              await page.fill('input[name="luci_username"]', 'root');
-              await page.fill('input[type="password"]', 'root');
-              await page.press('input[type="password"]', 'Enter');
-              await page.waitForLoadState('networkidle');
-
-              for (const [name, path] of pages) {
-                try {
-                  await page.goto(base + path, { waitUntil: 'networkidle' });
-                  await page.waitForTimeout(1200);
-                  const file = `${name}-${vpName}-${scheme}.png`;
-                  await page.screenshot({ path: `dist/shots/${file}`, fullPage: true });
-                  shots.push({ name, vpName, scheme, file });
-                } catch (e) {
-                  console.warn(`skip ${name}: ${e.message}`);
-                }
-              }
-              await ctx.close();
-            }
+          async function login(page) {
+            await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
+            await page.waitForSelector('input[type="password"]', { timeout: 20000 });
+            await page.locator('input[name="luci_username"], input[type="text"]').first().fill('root');
+            await page.fill('input[type="password"]', 'root');
+            await Promise.all([
+              page.waitForURL(/\/admin\//, { timeout: 20000 }),
+              page.press('input[type="password"]', 'Enter'),
+            ]);
           }
+
+          async function run(device, scheme) {
+            const ctx = await browser.newContext({ viewport: DEVICES[device], colorScheme: scheme });
+            const page = await ctx.newPage();
+            let jsErrors = [];
+            page.on('pageerror', e => jsErrors.push(String(e.message).slice(0, 160)));
+
+            // Trang đăng nhập
+            await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
+            await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+            await page.waitForTimeout(800);
+            await save(page, 'login', 'Login', 'Auth', device, scheme, []);
+
+            await login(page);
+
+            for (const [id, title, group, path, action] of PAGES) {
+              jsErrors = [];
+              try {
+                await page.goto(BASE + path, { waitUntil: 'domcontentloaded' });
+                await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+                await page.waitForTimeout(id === 'realtime' ? 4000 : 1500);
+                if (action) await action(page);
+                const issues = await page.evaluate(() => {
+                  const out = [];
+                  document.querySelectorAll('.alert-message.error, .alert-message.danger, .alert-message.warning')
+                    .forEach(e => { const t = e.textContent.trim().replace(/\s+/g, ' ').slice(0, 200); if (t) out.push(t); });
+                  if (document.querySelector('input[name="luci_password"]')) out.push('Mất phiên đăng nhập');
+                  if (/Forbidden|Not Found|Failed to execute|RPC call failed/i.test(document.body.innerText.slice(0, 2000)))
+                    out.push('Trang có thông báo lỗi');
+                  return out;
+                });
+                await save(page, id, title, group, device, scheme, [...issues, ...jsErrors]);
+              } catch (e) {
+                console.log(`::warning::${id} ${device}/${scheme}: ${e.message.split('\n')[0]}`);
+              }
+            }
+            await ctx.close();
+          }
+
+          async function save(page, id, title, group, device, scheme, issues) {
+            const name = `${id}-${device}-${scheme}`;
+            const buf = await page.screenshot({ fullPage: true });
+            const meta = await sharp(buf).metadata();
+            await sharp(buf).webp({ quality: 82 }).toFile(`dist/shots/${name}.webp`);
+            await sharp(buf).resize(480, 360, { fit: 'cover', position: 'top' }).webp({ quality: 72 }).toFile(`dist/shots/${name}-t.webp`);
+            if (issues.length) console.log(`::warning::${name}: ${issues.join(' | ')}`);
+            manifest.push({ id, title, group, device, scheme, w: meta.width, h: meta.height,
+                            full: `shots/${name}.webp`, thumb: `shots/${name}-t.webp`, issues });
+          }
+
+          await Promise.all(Object.keys(DEVICES).flatMap(d => SCHEMES.map(s => run(d, s))));
           await browser.close();
 
-          const card = s => `<figure><img loading="lazy" src="shots/${s.file}"><figcaption>${s.name} · ${s.vpName} · ${s.scheme}</figcaption></figure>`;
-          fs.writeFileSync('dist/index.html', `<!DOCTYPE html>
+          const order = PAGES.map(p => p[0]);
+          manifest.sort((a, b) => (a.id === 'login' ? -1 : b.id === 'login' ? 1 : order.indexOf(a.id) - order.indexOf(b.id))
+            || a.device.localeCompare(b.device) || a.scheme.localeCompare(b.scheme));
+          fs.writeFileSync('dist/manifest.json', JSON.stringify(manifest));
+          console.log(`Captured ${manifest.length} screenshots`);
+          EOF
+          node capture.mjs
+
+      - name: Build album UI
+        run: |
+          touch dist/.nojekyll
+          cat > dist/index.html <<'EOF'
+          <!DOCTYPE html>
           <html lang="vi"><head><meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>luci-theme-material3 preview</title>
+          <title>luci-theme-material3 · Preview</title>
           <style>
-            body{font-family:system-ui,sans-serif;margin:0;padding:24px;background:#f4f1f8;color:#1c1b1f}
-            h1{margin-top:0}
-            .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
-            figure{margin:0;background:#fff;border-radius:16px;padding:12px;box-shadow:0 1px 3px #0002}
-            img{width:100%;border-radius:8px;display:block}
-            figcaption{padding-top:8px;font-size:14px}
-            @media(prefers-color-scheme:dark){body{background:#1c1b1f;color:#e6e1e5}figure{background:#2b2930}}
+          :root{--bg:#fef7ff;--sf:#f3edf7;--fg:#1d1b20;--mut:#49454f;--pri:#6750a4;--onpri:#fff;--bd:#cac4d0;--warn:#b3261e}
+          @media(prefers-color-scheme:dark){:root{--bg:#141218;--sf:#211f26;--fg:#e6e0e9;--mut:#cac4d0;--pri:#d0bcff;--onpri:#381e72;--bd:#49454f;--warn:#f2b8b5}}
+          *{box-sizing:border-box}
+          body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+          header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--bd);padding:12px 20px}
+          h1{font-size:20px;margin:0 0 10px}
+          .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+          .seg{display:inline-flex;border:1px solid var(--bd);border-radius:20px;overflow:hidden}
+          button{font:inherit;color:var(--fg);background:none;border:0;padding:6px 14px;cursor:pointer}
+          .seg button.on,.chip.on{background:var(--pri);color:var(--onpri)}
+          .chip{border:1px solid var(--bd);border-radius:16px;padding:4px 12px}
+          input[type=search]{font:inherit;color:var(--fg);background:var(--sf);border:1px solid var(--bd);border-radius:20px;padding:6px 14px}
+          main{padding:8px 20px 40px}
+          h2{font-size:15px;color:var(--mut);margin:24px 0 10px;text-transform:uppercase;letter-spacing:.06em}
+          .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
+          .card{background:var(--sf);border-radius:16px;overflow:hidden;cursor:pointer;border:2px solid transparent}
+          .card:hover{border-color:var(--pri)}
+          .card img{width:100%;aspect-ratio:4/3;object-fit:cover;object-position:top;display:block;background:var(--bd)}
+          .meta{padding:8px 12px;display:flex;justify-content:space-between;gap:8px;font-size:13px}
+          .meta small{color:var(--mut)}
+          .bad{color:var(--warn);font-weight:700}
+          #lb{position:fixed;inset:0;background:#000e;display:none;flex-direction:column;z-index:10;color:#fff}
+          #lb.open{display:flex}
+          .lbbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;background:#000a}
+          .lbbar button{color:#fff;border:1px solid #fff4;border-radius:16px}
+          .lbbar button.on{background:#fff;color:#000}
+          .lbbar .sp{flex:1}
+          .lbimg{flex:1;overflow:auto;text-align:center;padding:12px}
+          .lbimg img{max-width:100%;height:auto;border-radius:8px;background:#fff1}
+          .lbimg.actual img{max-width:none}
+          #lbissue{padding:6px 14px;background:#b3261e;font-size:13px;display:none}
+          a{color:inherit}
           </style></head><body>
-          <h1>luci-theme-material3 — preview từ LuCI thật</h1>
-          <div class="grid">${shots.map(card).join('')}</div>
-          </body></html>`);
-          EOF
-          node shots.mjs
-          touch dist/.nojekyll
+          <header>
+            <h1>luci-theme-material3 — preview từ LuCI thật <small id="count" style="color:var(--mut);font-weight:400"></small></h1>
+            <div class="bar">
+              <span class="seg" id="fDevice"></span>
+              <span class="seg" id="fScheme"></span>
+              <span id="fGroup" class="bar"></span>
+              <input type="search" id="q" placeholder="Tìm trang...">
+            </div>
+          </header>
+          <main id="main"></main>
+          <div id="lb">
+            <div class="lbbar">
+              <button id="prev">←</button><button id="next">→</button>
+              <strong id="lbtitle"></strong><span id="lbpos" style="opacity:.7"></span>
+              <span class="seg" id="vDevice"></span><span class="seg" id="vScheme"></span>
+              <span class="sp"></span>
+              <button id="fit">Kích thước thật (F)</button>
+              <a id="dl" download><button>Tải về</button></a>
+              <button id="close">✕</button>
+            </div>
+            <div id="lbissue"></div>
+            <div class="lbimg" id="lbimg"><img id="lbpic" alt=""></div>
+          </div>
+          <script>
+          const $ = s => document.querySelector(s);
+          const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+          const LBL = {all:'Tất cả',desktop:'Desktop',mobile:'Mobile',light:'Sáng',dark:'Tối'};
+          let data = [], list = [], cur = null;
+          const F = {device:'desktop', scheme:'light', group:'all', q:''};
 
-      - name: Dump logs on failure
-        if: failure()
+          fetch('manifest.json').then(r => r.json()).then(d => { data = d; init(); });
+
+          function seg(el, key, vals, onPick) {
+            el.innerHTML = vals.map(v => `<button data-v="${v}" class="${F[key]===v?'on':''}">${LBL[v]||v}</button>`).join('');
+            el.onclick = e => { const v = e.target.dataset.v; if (v) { F[key] = v; onPick(); } };
+          }
+          function init() {
+            const groups = ['all', ...new Set(data.map(x => x.group))];
+            const draw = () => {
+              seg($('#fDevice'), 'device', ['all','desktop','mobile'], draw);
+              seg($('#fScheme'), 'scheme', ['all','light','dark'], draw);
+              $('#fGroup').innerHTML = groups.map(g => `<button class="chip ${F.group===g?'on':''}" data-g="${g}">${g==='all'?'Tất cả nhóm':g}</button>`).join('');
+              render();
+            };
+            $('#fGroup').onclick = e => { if (e.target.dataset.g) { F.group = e.target.dataset.g; draw(); } };
+            $('#q').oninput = e => { F.q = e.target.value.toLowerCase(); render(); };
+            draw();
+            openFromHash();
+          }
+          function render() {
+            list = data.filter(x => (F.device==='all'||x.device===F.device) && (F.scheme==='all'||x.scheme===F.scheme)
+              && (F.group==='all'||x.group===F.group) && (!F.q || (x.title+' '+x.id).toLowerCase().includes(F.q)));
+            $('#count').textContent = `(${list.length} ảnh)`;
+            const by = {};
+            list.forEach(x => (by[x.group] = by[x.group] || []).push(x));
+            $('#main').innerHTML = Object.entries(by).map(([g, items]) =>
+              `<h2>${esc(g)}</h2><div class="grid">` + items.map(x => {
+                const i = data.indexOf(x);
+                return `<div class="card" data-i="${i}"><img loading="lazy" src="${x.thumb}" alt="">
+                  <div class="meta"><span>${esc(x.title)}${x.issues.length?` <span class="bad" title="${esc(x.issues.join('\n'))}">⚠</span>`:''}</span>
+                  <small>${x.device} · ${x.scheme}</small></div></div>`;
+              }).join('') + '</div>').join('') || '<p>Không có ảnh khớp bộ lọc.</p>';
+          }
+          $('#main').onclick = e => { const c = e.target.closest('.card'); if (c) open(data[+c.dataset.i]); };
+
+          function open(x) {
+            cur = x;
+            location.hash = `${x.id}-${x.device}-${x.scheme}`;
+            $('#lb').classList.add('open');
+            $('#lbpic').src = x.full;
+            $('#lbtitle').textContent = x.title;
+            const arr = list.includes(x) ? list : data;
+            $('#lbpos').textContent = `${arr.indexOf(x)+1}/${arr.length}`;
+            $('#dl').href = x.full;
+            const bad = $('#lbissue');
+            bad.style.display = x.issues.length ? 'block' : 'none';
+            bad.textContent = '⚠ ' + x.issues.join(' | ');
+            const variantBtns = (el, key, vals) => {
+              el.innerHTML = vals.map(v => `<button data-v="${v}" class="${x[key]===v?'on':''}">${LBL[v]}</button>`).join('');
+              el.onclick = e => {
+                const v = e.target.dataset.v; if (!v) return;
+                const t = data.find(y => y.id===x.id && y.device===(key==='device'?v:x.device) && y.scheme===(key==='scheme'?v:x.scheme));
+                if (t) open(t);
+              };
+            };
+            variantBtns($('#vDevice'), 'device', ['desktop','mobile']);
+            variantBtns($('#vScheme'), 'scheme', ['light','dark']);
+            $('#lbimg').scrollTop = 0;
+          }
+          function close() { $('#lb').classList.remove('open'); history.replaceState(null, '', location.pathname); }
+          function nav(d) {
+            const arr = list.includes(cur) ? list : data;
+            open(arr[(arr.indexOf(cur) + d + arr.length) % arr.length]);
+          }
+          function openFromHash() {
+            const h = location.hash.slice(1);
+            const x = data.find(y => `${y.id}-${y.device}-${y.scheme}` === h);
+            if (x) open(x);
+          }
+          $('#close').onclick = close;
+          $('#prev').onclick = () => nav(-1);
+          $('#next').onclick = () => nav(1);
+          $('#fit').onclick = () => $('#lbimg').classList.toggle('actual');
+          $('#lbimg').onclick = e => { if (e.target.id === 'lbimg') close(); };
+          addEventListener('keydown', e => {
+            if (!$('#lb').classList.contains('open')) return;
+            if (e.key === 'Escape') close();
+            else if (e.key === 'ArrowLeft') nav(-1);
+            else if (e.key === 'ArrowRight') nav(1);
+            else if (e.key.toLowerCase() === 'f') $('#lbimg').classList.toggle('actual');
+          });
+          </script></body></html>
+          EOF
+
+      - name: Diagnostics
+        if: always()
         run: |
+          docker exec owrt ip addr || true
           docker exec owrt ps || true
+          docker exec owrt ubus call network.interface.lan status || true
+          docker exec owrt ubus call system board || true
           docker exec owrt ls /usr/share/ucode/luci/template/themes/ || true
-          curl -is http://localhost:8080/cgi-bin/luci/ | head -n 40 || true
-          docker logs owrt | tail -n 100
+          curl -is http://localhost:8080/cgi-bin/luci/ | head -n 30 || true
+          docker logs owrt | tail -n 80 || true
 
       - uses: actions/configure-pages@v5
 
