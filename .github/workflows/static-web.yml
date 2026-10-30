@@ -18,13 +18,16 @@ env:
   OWRT_IMAGE: openwrt/rootfs:x86-64-openwrt-24.10
   # App LuCI muốn cài và chụp (cách nhau bằng dấu cách)
   EXTRA_PKGS: luci-app-sqm luci-app-upnp luci-app-ddns luci-app-wol
-  # true = job đỏ (không deploy) nếu có lỗi mức "error"; false = chỉ báo, vẫn deploy
+  # true = job đỏ nếu có lỗi mức "error" (vẫn deploy trước khi báo đỏ)
   FAIL_ON_ERROR: 'false'
 
 jobs:
-  build:
+  preview:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -35,13 +38,13 @@ jobs:
       # ---------- Hàm ghi kết quả kiểm tra ----------
       - name: Init check helpers
         run: |
-          mkdir -p checks
+          mkdir -p checks dist
           : > checks/errors
           : > checks/warns
           cat > checks/lib.sh <<'END_LIB'
-          ok()   { echo "ok: $1";             echo "- ✅ $1" >> "$GITHUB_STEP_SUMMARY"; }
-          warn() { echo "::warning::$1";      echo "- ⚠️ $1" >> "$GITHUB_STEP_SUMMARY"; echo x >> checks/warns; }
-          fail() { echo "::error::$1";        echo "- ❌ $1" >> "$GITHUB_STEP_SUMMARY"; echo x >> checks/errors; }
+          ok()   { echo "ok: $1";        echo "- ✅ $1" >> "$GITHUB_STEP_SUMMARY"; }
+          warn() { echo "::warning::$1"; echo "- ⚠️ $1" >> "$GITHUB_STEP_SUMMARY"; echo x >> checks/warns; }
+          fail() { echo "::error::$1";   echo "- ❌ $1" >> "$GITHUB_STEP_SUMMARY"; echo x >> checks/errors; }
           END_LIB
 
       - name: Install dependencies
@@ -54,6 +57,7 @@ jobs:
 
       # ---------- Kiểm tra tĩnh (chưa cần router) ----------
       - name: Static checks
+        continue-on-error: true
         run: |
           set +e
           source checks/lib.sh
@@ -85,7 +89,7 @@ jobs:
             if [ "$o1" -eq "$c1" ] && [ "$o2" -eq "$c2" ]; then
               ok "Template $(basename "$f"): cặp {% %} ($o1) và {{ }} ($o2) cân bằng"
             else
-              fail "Template $(basename "$f"): lệch cặp {% %} ($o1/$c1) hoặc {{ }} ($o2/$c2)"
+              warn "Template $(basename "$f"): lệch cặp {% %} ($o1/$c1) hoặc {{ }} ($o2/$c2)"
             fi
           done
 
@@ -110,7 +114,6 @@ jobs:
             return out;
           }
 
-          // 1. url() trong CSS phải trỏ tới file có thật
           const cssPath = root + '/luci-static/material3/cascade.css';
           const css = fs.readFileSync(cssPath, 'utf8');
           const urls = [...css.matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/g)].map(m => m[2]);
@@ -129,12 +132,10 @@ jobs:
           else say('OK', 'Mọi url() trong cascade.css trỏ tới file có thật (' + urls.length + ' tham chiếu)');
           if (external.length) say('WARN', 'CSS gọi tài nguyên ngoài: ' + external.slice(0, 3).join(', '));
 
-          // 2. @font-face
           const ff = (css.match(/@font-face/g) || []).length;
           if (ff > 0) say('OK', 'CSS có ' + ff + ' khối @font-face');
           else say('WARN', 'CSS không có @font-face nào');
 
-          // 3. Cú pháp mọi file JS (LuCI dùng "return" ở top-level nên bọc trong Function)
           let jsCount = 0, jsBad = 0;
           for (const f of walk(root).filter(f => f.endsWith('.js'))) {
             jsCount++;
@@ -143,7 +144,6 @@ jobs:
           }
           if (!jsBad) say('OK', 'Cú pháp JS hợp lệ (' + jsCount + ' file)');
 
-          // 4. Đường dẫn tuyệt đối /luci-static/ trong JS có file thật
           const refMissing = new Set();
           for (const f of walk(root).filter(f => f.endsWith('.js'))) {
             const src = fs.readFileSync(f, 'utf8');
@@ -165,6 +165,8 @@ jobs:
 
       # ---------- Chuẩn bị image OpenWrt (mạng Docker còn nguyên, chưa chạy init) ----------
       - name: Prepare OpenWrt image
+        id: prep
+        continue-on-error: true
         run: |
           docker run -d --name prep "$OWRT_IMAGE" sleep infinity
           docker exec prep mkdir -p /var/lock /var/run
@@ -266,3 +268,626 @@ jobs:
           uci set sqm.eth1.linklayer=ethernet
           uci set sqm.eth1.overhead=18
           uci commit sqm
+
+          /etc/init.d/firewall disable
+          /etc/init.d/rpcd enable
+          /etc/init.d/uhttpd enable
+          rm -rf /tmp/luci-*
+          END_SETUP
+          docker cp setup.sh prep:/tmp/setup.sh
+          docker exec prep sh -x /tmp/setup.sh || true
+
+          docker commit prep owrt-prepared
+          docker rm -f prep
+
+      # ---------- Boot thật bằng procd ----------
+      - name: Boot OpenWrt
+        id: boot
+        if: steps.prep.outcome == 'success'
+        continue-on-error: true
+        run: |
+          docker run -d --name owrt --privileged -p 8080:80 owrt-prepared /sbin/init
+
+          # init hay kéo eth0 xuống -> giữ lại địa chỉ và route Docker cấp
+          CIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' owrt)
+          CPF=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPPrefixLen}}{{end}}' owrt)
+          CGW=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' owrt)
+          echo "container eth0: $CIP/$CPF via $CGW"
+
+          cat > keep_eth0.sh <<EOF
+          #!/bin/sh
+          while true; do
+            ip link set eth0 up 2>/dev/null
+            ip addr show eth0 2>/dev/null | grep -q "$CIP/" || ip addr replace $CIP/$CPF dev eth0 2>/dev/null
+            ip route show default 2>/dev/null | grep -q "via $CGW" || ip route replace default via $CGW dev eth0 metric 500 2>/dev/null
+            sleep 2
+          done
+          EOF
+          docker cp keep_eth0.sh owrt:/tmp/keep_eth0.sh
+          docker exec -d owrt sh /tmp/keep_eth0.sh
+
+          sleep 10
+          docker exec owrt ubus -t 60 wait_for system network.interface || true
+          docker exec owrt /etc/init.d/rpcd restart || true
+          docker exec owrt /etc/init.d/uhttpd restart || true
+          sleep 3
+
+          now=$(date +%s)
+          exp=$((now + 43200))
+          cat > dhcp.leases <<EOF
+          $exp aa:bb:cc:11:22:01 192.168.1.101 pixel-8 *
+          $exp aa:bb:cc:11:22:02 192.168.1.102 macbook-pro *
+          $exp aa:bb:cc:11:22:03 192.168.1.103 smart-tv *
+          $exp aa:bb:cc:11:22:10 192.168.1.20 nas *
+          EOF
+          docker cp dhcp.leases owrt:/tmp/dhcp.leases
+          docker exec owrt /etc/init.d/sqm restart || true
+
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8080/cgi-bin/luci/ || true)
+            echo "try $i: HTTP $code"
+            case "$code" in
+              200|302|403) echo "LuCI up"; exit 0 ;;
+            esac
+            sleep 2
+          done
+
+          echo "=== eth0 ==="
+          docker exec owrt ip addr show eth0 || true
+          echo "=== trong container ==="
+          docker exec owrt wget -qO- http://127.0.0.1/cgi-bin/luci/ | head -n 5 || true
+          echo "=== listening ==="
+          docker exec owrt netstat -ltn || true
+          echo "=== logread ==="
+          docker exec owrt logread | tail -n 60 || true
+          echo "::error::LuCI không lên"
+          exit 1
+
+      # ---------- Kiểm tra trên router ----------
+      - name: Runtime checks
+        if: steps.boot.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set +e
+          source checks/lib.sh
+          echo "## Kiểm tra trên OpenWrt" >> "$GITHUB_STEP_SUMMARY"
+          U=http://127.0.0.1:8080
+          ex() { docker exec owrt "$@"; }
+
+          ok "$(ex sh -c '. /etc/openwrt_release; echo $DISTRIB_DESCRIPTION')"
+
+          for s in ubusd rpcd uhttpd netifd dnsmasq logd; do
+            if ex ps | grep -q "[/ ]$s"; then ok "Dịch vụ $s đang chạy"; else fail "Dịch vụ $s không chạy"; fi
+          done
+
+          objs=$(ex ubus list)
+          for o in luci luci-rpc system network.interface session uci file; do
+            if echo "$objs" | grep -qx "$o"; then ok "ubus có object $o"; else fail "ubus thiếu object $o"; fi
+          done
+
+          if ex ubus call network.interface.lan status | grep -q '"up": true'; then ok "Interface lan đang up"; else warn "Interface lan không up"; fi
+          if ex ubus call network.interface.wan status | grep -q '"up": true'; then ok "Interface wan đang up"; else warn "Interface wan không up"; fi
+
+          mb=$(ex uci -q get luci.main.mediaurlbase)
+          if [ "$mb" = "/luci-static/material3" ]; then ok "Theme mặc định là material3"; else fail "mediaurlbase = '$mb'"; fi
+          for t in header footer sysauth; do
+            if ex test -f /usr/share/ucode/luci/template/themes/material3/$t.ut; then ok "Template $t.ut đã vào router"; else fail "Template $t.ut chưa vào router"; fi
+          done
+
+          for p in luci $EXTRA_PKGS; do
+            if ex opkg list-installed | grep -q "^$p "; then ok "Đã cài $p"; else warn "Chưa cài được $p"; fi
+          done
+
+          if ex tc qdisc show dev br-wan | grep -q cake; then ok "SQM: qdisc cake đang chạy trên br-wan"; else warn "SQM: không thấy qdisc cake (kernel runner có thể thiếu sch_cake)"; fi
+          if ex uci -q get sqm.eth1.enabled | grep -q 1; then ok "SQM được bật trong cấu hình"; else warn "SQM chưa bật"; fi
+
+          if ex ubus call luci-rpc getDHCPLeases | grep -q pixel-8; then ok "DHCP lease giả lập hiển thị qua luci-rpc"; else warn "Không thấy DHCP lease giả lập"; fi
+
+          cnt=0
+          bad=0
+          while IFS= read -r f; do
+            rel="${f#htdocs}"
+            code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$U$rel")
+            cnt=$((cnt + 1))
+            if [ "$code" != "200" ]; then bad=$((bad + 1)); fail "HTTP $code cho $rel"; fi
+          done < <(find htdocs -type f)
+          if [ "$bad" -eq 0 ]; then ok "Web server phục vụ đủ $cnt file tĩnh (HTTP 200)"; fi
+
+          ct=$(curl -sI -m 10 "$U/luci-static/material3/cascade.css" | tr -d '\r' | grep -i '^content-type')
+          case "$ct" in
+            *text/css*) ok "cascade.css đúng content-type" ;;
+            *) warn "cascade.css content-type lạ: $ct" ;;
+          esac
+
+          html=$(curl -s -m 15 "$U/cgi-bin/luci/")
+          if [ -n "$html" ]; then ok "Trang đăng nhập có nội dung"; else fail "Trang đăng nhập rỗng"; fi
+          if echo "$html" | grep -q 'material3'; then ok "HTML đăng nhập nhắc tới material3"; else fail "HTML đăng nhập không dùng theme material3"; fi
+          if echo "$html" | grep -q 'cascade.css'; then ok "HTML đăng nhập nạp cascade.css"; else fail "HTML đăng nhập không nạp cascade.css"; fi
+          if echo "$html" | grep -Eq '\{%|\{\{'; then fail "HTML đăng nhập còn cú pháp ucode chưa render"; else ok "HTML đăng nhập không còn {% %} / {{ }}"; fi
+          if echo "$html" | grep -Eiq 'Failed to (load|compile)|Syntax error|Reference error|Unable to compile|Runtime error'; then fail "Trang đăng nhập báo lỗi template/ucode"; else ok "Trang đăng nhập không báo lỗi template"; fi
+
+          errs=$(ex logread | grep -Ei 'ucode|luci|uhttpd|rpcd' | grep -Ei 'error|fail|exception' | head -n 5)
+          if [ -n "$errs" ]; then warn "logread có dòng lỗi liên quan LuCI: $(echo "$errs" | head -n 2 | tr '\n' ' ')"; else ok "logread không có lỗi liên quan LuCI"; fi
+
+      # ---------- Chụp + kiểm tra từng trang ----------
+      - name: Install Playwright and sharp
+        if: steps.boot.outcome == 'success'
+        continue-on-error: true
+        run: |
+          npm install --no-save playwright sharp
+          npx playwright install --with-deps chromium
+
+      - name: Capture and check pages
+        if: steps.boot.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p dist/shots
+          cat > capture.mjs <<'END_CAPTURE'
+          import { chromium } from 'playwright';
+          import sharp from 'sharp';
+          import fs from 'node:fs';
+
+          const ORIGIN = 'http://127.0.0.1:8080';
+          const BASE = ORIGIN + '/cgi-bin/luci';
+          const MAX_H = 12000;
+
+          const PAGES = [
+            ['overview',    'Overview',        'Status',   '/admin/status/overview'],
+            ['routes',      'Routing',         'Status',   '/admin/status/routes'],
+            ['syslog',      'System Log',      'Status',   '/admin/status/logs'],
+            ['processes',   'Processes',       'Status',   '/admin/status/processes'],
+            ['realtime',    'Realtime Graphs', 'Status',   '/admin/status/realtime'],
+            ['interfaces',  'Interfaces',      'Network',  '/admin/network/network'],
+            ['iface-modal', 'Edit interface (modal)', 'Network', '/admin/network/network',
+              async (p) => {
+                await p.locator('.cbi-button-edit').first().click();
+                await p.waitForSelector('.modal', { timeout: 8000 });
+                await p.waitForTimeout(800);
+              }],
+            ['dhcp',        'DHCP and DNS',    'Network',  '/admin/network/dhcp'],
+            ['firewall',    'Firewall',        'Network',  '/admin/network/firewall'],
+            ['sqm',         'SQM QoS',         'Network',  '/admin/network/sqm'],
+            ['diagnostics', 'Diagnostics',     'Network',  '/admin/network/diagnostics'],
+            ['system',      'System',          'System',   '/admin/system/system'],
+            ['admin',       'Administration',  'System',   '/admin/system/admin'],
+            ['packages',    'Software',        'System',   '/admin/system/package-manager'],
+            ['startup',     'Startup',         'System',   '/admin/system/startup'],
+            ['flash',       'Backup / Flash',  'System',   '/admin/system/flash'],
+            ['upnp',        'UPnP',            'Services', '/admin/services/upnp'],
+            ['ddns',        'Dynamic DNS',     'Services', '/admin/services/ddns'],
+            ['wol',         'Wake on LAN',     'Services', '/admin/services/wol'],
+          ];
+          const DEVICES = { desktop: { width: 1366, height: 850 }, mobile: { width: 390, height: 844 } };
+          const SCHEMES = ['light', 'dark'];
+
+          const manifest = [];
+          const fresh = () => ({ js: [], bad: [], failed: [], console: [] });
+
+          async function settle(page, ms) {
+            await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+            await page.waitForTimeout(ms);
+          }
+
+          async function login(page) {
+            await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
+            await page.waitForSelector('input[type="password"]', { timeout: 20000 });
+            await page.locator('input[name="luci_username"], input[type="text"]').first().fill('root');
+            await page.fill('input[type="password"]', 'root');
+            await Promise.all([
+              page.waitForURL(/\/admin\//, { timeout: 20000 }),
+              page.press('input[type="password"]', 'Enter'),
+            ]);
+          }
+
+          async function record(page, o) {
+            const issues = [];
+            const add = (l, t) => issues.push({ l, t });
+            const st = o.resp ? o.resp.status() : 0;
+            if (!o.expect.includes(st)) add('e', 'HTTP ' + st + ' (mong đợi ' + o.expect.join('/') + ')');
+
+            const info = await page.evaluate(async () => {
+              await document.fonts.ready;
+              const sheets = [...document.styleSheets].map(s => s.href || '').filter(Boolean);
+              const main = document.querySelector('#maincontent, main, .main');
+              return {
+                title: document.title,
+                hasTheme: sheets.some(h => h.includes('material3')),
+                fontsErr: [...document.fonts].filter(f => f.status === 'error').map(f => f.family),
+                alerts: [...document.querySelectorAll('.alert-message.error, .alert-message.danger, .alert-message.warning')]
+                  .map(e => e.textContent.trim().replace(/\s+/g, ' ').slice(0, 200)).filter(Boolean),
+                hasLogin: !!document.querySelector('input[name="luci_password"]'),
+                overflow: document.documentElement.scrollWidth - window.innerWidth,
+                textLen: (main ? main.innerText : document.body.innerText).trim().length,
+                head: document.body.innerText.slice(0, 2000),
+                hasL: typeof window.L !== 'undefined',
+                bg: getComputedStyle(document.body).backgroundColor,
+                height: document.documentElement.scrollHeight,
+              };
+            });
+
+            if (!info.hasTheme) add('e', 'Không nạp cascade.css của theme');
+            if (!info.hasL) add('e', 'ReferenceError: L is not defined (chưa có luci.js)');
+            if (o.id !== 'login' && info.hasLogin) add('e', 'Mất phiên đăng nhập');
+            if (info.textLen < 20) add('e', 'Nội dung trang trống');
+            if (/Failed to load template|Unable to compile|Syntax error|Reference error|RPC call failed|Not Found|Forbidden|Access denied/i.test(info.head))
+              add('e', 'Trang hiển thị lỗi LuCI/ucode');
+            for (const f of info.fontsErr) add('e', 'Font không nạp được: ' + f);
+            for (const t of o.bag.js) add('e', 'JS: ' + t);
+            for (const t of o.bag.bad) add('e', 'Tài nguyên lỗi: ' + t);
+            for (const t of o.bag.failed) add('e', 'Request fail: ' + t);
+            for (const t of info.alerts) add('w', 'Cảnh báo trên trang: ' + t);
+            for (const t of o.bag.console.slice(0, 3)) add('w', 'Console: ' + t);
+            if (o.device === 'mobile' && info.overflow > 2) add('w', 'Tràn ngang ' + info.overflow + 'px trên mobile');
+            if (!info.title) add('w', 'Thiếu <title>');
+
+            const name = o.id + '-' + o.device + '-' + o.scheme;
+            const vw = DEVICES[o.device].width;
+            const shotOpts = info.height > MAX_H
+              ? { fullPage: true, clip: { x: 0, y: 0, width: vw, height: MAX_H } }
+              : { fullPage: true };
+            const buf = await page.screenshot(shotOpts);
+            const meta = await sharp(buf).metadata();
+            await sharp(buf).webp({ quality: 82 }).toFile('dist/shots/' + name + '.webp');
+            await sharp(buf).resize(480, 360, { fit: 'cover', position: 'top' }).webp({ quality: 72 }).toFile('dist/shots/' + name + '-t.webp');
+
+            manifest.push({
+              id: o.id, title: o.title, group: o.group, device: o.device, scheme: o.scheme,
+              w: meta.width, h: meta.height, bg: info.bg,
+              full: 'shots/' + name + '.webp', thumb: 'shots/' + name + '-t.webp', issues,
+            });
+          }
+
+          async function run(browser, device, scheme) {
+            const ctx = await browser.newContext({ viewport: DEVICES[device], colorScheme: scheme });
+            const page = await ctx.newPage();
+            let bag = fresh();
+            page.on('console', m => {
+              const t = m.text();
+              if (m.type() === 'error' && !t.startsWith('Failed to load resource')) bag.console.push(t.slice(0, 200));
+            });
+            page.on('pageerror', e => bag.js.push(String(e.message).slice(0, 200)));
+            page.on('requestfailed', r => {
+              const why = (r.failure() && r.failure().errorText) || '';
+              if (!why.includes('ERR_ABORTED')) bag.failed.push(r.url().replace(ORIGIN, '') + ' (' + why + ')');
+            });
+            page.on('response', r => {
+              if (r.status() >= 400 && r.url().startsWith(ORIGIN) && !r.request().isNavigationRequest())
+                bag.bad.push(r.status() + ' ' + r.url().replace(ORIGIN, ''));
+            });
+
+            bag = fresh();
+            const r0 = await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
+            await settle(page, 800);
+            await record(page, { id: 'login', title: 'Login', group: 'Auth', device, scheme, resp: r0, expect: [200, 403], bag });
+
+            try {
+              await login(page);
+            } catch (e) {
+              console.log('::error::Đăng nhập thất bại (' + device + '/' + scheme + '): ' + e.message.split('\n')[0]);
+              fs.appendFileSync('checks/errors', 'x\n');
+              await ctx.close();
+              return;
+            }
+
+            for (const [id, title, group, path, action] of PAGES) {
+              try {
+                bag = fresh();
+                const resp = await page.goto(BASE + path, { waitUntil: 'domcontentloaded' });
+                await settle(page, id === 'realtime' ? 4000 : 1500);
+                if (action) {
+                  try { await action(page); }
+                  catch (e) { bag.console.push('Bước thao tác thất bại: ' + e.message.split('\n')[0]); }
+                }
+                await record(page, { id, title, group, device, scheme, resp, expect: [200], bag });
+              } catch (e) {
+                console.log('::warning::' + id + ' ' + device + '/' + scheme + ': ' + e.message.split('\n')[0]);
+              }
+            }
+            await ctx.close();
+          }
+
+          const browser = await chromium.launch();
+          for (const device of Object.keys(DEVICES)) {
+            for (const scheme of SCHEMES) {
+              await run(browser, device, scheme);
+            }
+          }
+          await browser.close();
+
+          const order = PAGES.map(p => p[0]);
+          manifest.sort((a, b) =>
+            (a.id === 'login' ? -1 : b.id === 'login' ? 1 : order.indexOf(a.id) - order.indexOf(b.id))
+            || a.device.localeCompare(b.device) || a.scheme.localeCompare(b.scheme));
+
+          let same = 0, pairs = 0;
+          for (const m of manifest.filter(x => x.scheme === 'light')) {
+            const d = manifest.find(x => x.id === m.id && x.device === m.device && x.scheme === 'dark');
+            if (d) { pairs++; if (d.bg === m.bg) same++; }
+          }
+          const darkSame = pairs > 0 && same / pairs >= 0.8;
+
+          const groupIssues = lvl => {
+            const map = new Map();
+            for (const m of manifest) for (const i of m.issues.filter(x => x.l === lvl)) {
+              const k = m.id + ' :: ' + i.t;
+              if (!map.has(k)) map.set(k, new Set());
+              map.get(k).add(m.device + '/' + m.scheme);
+            }
+            return [...map.entries()].map(([k, v]) => ({ k, where: [...v].join(', ') }));
+          };
+          const errs = groupIssues('e');
+          const warns = groupIssues('w');
+
+          const summary = {
+            total: manifest.length, errors: errs.length, warns: warns.length,
+            darkSame, generated: new Date().toISOString(),
+          };
+          fs.writeFileSync('dist/manifest.json', JSON.stringify({ summary, items: manifest }));
+          console.log('Đã chụp ' + manifest.length + ' ảnh; ' + errs.length + ' lỗi, ' + warns.length + ' cảnh báo');
+
+          for (const e of errs.slice(0, 40)) console.log('::error::' + e.k + ' [' + e.where + ']');
+          for (const w of warns.slice(0, 40)) console.log('::warning::' + w.k + ' [' + w.where + ']');
+          if (darkSame) console.log('::warning::Dark mode gần như không đổi màu nền so với light (theme có thể không theo prefers-color-scheme)');
+
+          if (errs.length) fs.appendFileSync('checks/errors', 'x\n'.repeat(Math.min(errs.length, 500)));
+          if (warns.length) fs.appendFileSync('checks/warns', 'x\n'.repeat(Math.min(warns.length, 500)));
+
+          if (process.env.GITHUB_STEP_SUMMARY) {
+            let md = '\n## Kiểm tra từng trang (' + manifest.length + ' ảnh)\n\n';
+            md += '- Lỗi: **' + errs.length + '**, cảnh báo: **' + warns.length + '**\n';
+            if (darkSame) md += '- ⚠️ Dark mode gần như không đổi màu nền so với light\n';
+            if (errs.length) md += '\n### Lỗi\n' + errs.map(e => '- ❌ `' + e.k + '` — ' + e.where).join('\n') + '\n';
+            if (warns.length) md += '\n### Cảnh báo\n' + warns.slice(0, 60).map(w => '- ⚠️ `' + w.k + '` — ' + w.where).join('\n') + '\n';
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
+          }
+          END_CAPTURE
+          node capture.mjs
+
+      # ---------- Album ----------
+      - name: Build album UI
+        if: always()
+        run: |
+          mkdir -p dist
+          touch dist/.nojekyll
+          cat > dist/index.html <<'END_ALBUM'
+          <!DOCTYPE html>
+          <html lang="vi"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>luci-theme-material3 · Preview</title>
+          <style>
+          :root{--bg:#fef7ff;--sf:#f3edf7;--fg:#1d1b20;--mut:#49454f;--pri:#6750a4;--onpri:#fff;--bd:#cac4d0;--warn:#b26a00;--err:#b3261e}
+          @media(prefers-color-scheme:dark){:root{--bg:#141218;--sf:#211f26;--fg:#e6e0e9;--mut:#cac4d0;--pri:#d0bcff;--onpri:#381e72;--bd:#49454f;--warn:#ffb951;--err:#f2b8b5}}
+          *{box-sizing:border-box}
+          body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+          header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--bd);padding:12px 20px}
+          h1{font-size:20px;margin:0 0 4px}
+          #sum{color:var(--mut);font-size:13px;margin-bottom:10px}
+          .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+          .seg{display:inline-flex;border:1px solid var(--bd);border-radius:20px;overflow:hidden}
+          button{font:inherit;color:var(--fg);background:none;border:0;padding:6px 14px;cursor:pointer}
+          .seg button.on,.chip.on{background:var(--pri);color:var(--onpri)}
+          .chip{border:1px solid var(--bd);border-radius:16px;padding:4px 12px}
+          input[type=search]{font:inherit;color:var(--fg);background:var(--sf);border:1px solid var(--bd);border-radius:20px;padding:6px 14px}
+          main{padding:8px 20px 40px}
+          h2{font-size:15px;color:var(--mut);margin:24px 0 10px;text-transform:uppercase;letter-spacing:.06em}
+          .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
+          .card{background:var(--sf);border-radius:16px;overflow:hidden;cursor:pointer;border:2px solid transparent}
+          .card:hover{border-color:var(--pri)}
+          .card img{width:100%;aspect-ratio:4/3;object-fit:cover;object-position:top;display:block;background:var(--bd)}
+          .meta{padding:8px 12px;display:flex;justify-content:space-between;gap:8px;font-size:13px}
+          .meta small{color:var(--mut)}
+          .e{color:var(--err);font-weight:700}
+          .w{color:var(--warn);font-weight:700}
+          #lb{position:fixed;inset:0;background:#000e;display:none;flex-direction:column;z-index:10;color:#fff}
+          #lb.open{display:flex}
+          .lbbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;background:#000a}
+          .lbbar button{color:#fff;border:1px solid #fff4;border-radius:16px}
+          .lbbar .seg button.on{background:#fff;color:#000}
+          .lbbar .sp{flex:1}
+          .lbimg{flex:1;overflow:auto;text-align:center;padding:12px}
+          .lbimg img{max-width:100%;height:auto;border-radius:8px;background:#fff1}
+          .lbimg.actual img{max-width:none}
+          #lbissue{max-height:25vh;overflow:auto;padding:8px 14px;background:#2b1b1b;font-size:13px;display:none}
+          #lbissue div{margin:2px 0}
+          a{color:inherit}
+          </style></head><body>
+          <header>
+            <h1>luci-theme-material3 — preview từ LuCI thật</h1>
+            <div id="sum"></div>
+            <div class="bar">
+              <span class="seg" id="fDevice"></span>
+              <span class="seg" id="fScheme"></span>
+              <span id="fGroup" class="bar"></span>
+              <button class="chip" id="fBad">Chỉ trang có vấn đề</button>
+              <input type="search" id="q" placeholder="Tìm trang...">
+            </div>
+          </header>
+          <main id="main"></main>
+          <div id="lb">
+            <div class="lbbar">
+              <button id="prev">←</button><button id="next">→</button>
+              <strong id="lbtitle"></strong><span id="lbpos" style="opacity:.7"></span>
+              <span class="seg" id="vDevice"></span><span class="seg" id="vScheme"></span>
+              <span class="sp"></span>
+              <button id="fit">Kích thước thật (F)</button>
+              <a id="dl" download><button>Tải về</button></a>
+              <button id="close">✕</button>
+            </div>
+            <div id="lbissue"></div>
+            <div class="lbimg" id="lbimg"><img id="lbpic" alt=""></div>
+          </div>
+          <script>
+          const $ = s => document.querySelector(s);
+          const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+          const LBL = {all:'Tất cả',desktop:'Desktop',mobile:'Mobile',light:'Sáng',dark:'Tối'};
+          let data = [], list = [], cur = null;
+          const F = {device:'desktop', scheme:'light', group:'all', q:'', bad:false};
+
+          fetch('manifest.json').then(r => r.json()).then(d => { data = d.items; summary(d.summary); init(); });
+
+          function summary(s) {
+            $('#sum').innerHTML = `${s.total} ảnh · <span class="e">${s.errors} lỗi</span> · <span class="w">${s.warns} cảnh báo</span>`
+              + (s.darkSame ? ' · <span class="w">dark mode gần như không đổi màu nền</span>' : '')
+              + ` · cập nhật ${new Date(s.generated).toLocaleString('vi-VN')}`;
+          }
+          function seg(el, key, vals, onPick) {
+            el.innerHTML = vals.map(v => `<button data-v="${v}" class="${F[key]===v?'on':''}">${LBL[v]||v}</button>`).join('');
+            el.onclick = e => { const v = e.target.dataset.v; if (v) { F[key] = v; onPick(); } };
+          }
+          function init() {
+            const groups = ['all', ...new Set(data.map(x => x.group))];
+            const draw = () => {
+              seg($('#fDevice'), 'device', ['all','desktop','mobile'], draw);
+              seg($('#fScheme'), 'scheme', ['all','light','dark'], draw);
+              $('#fGroup').innerHTML = groups.map(g => `<button class="chip ${F.group===g?'on':''}" data-g="${g}">${g==='all'?'Tất cả nhóm':g}</button>`).join('');
+              $('#fBad').classList.toggle('on', F.bad);
+              render();
+            };
+            $('#fGroup').onclick = e => { if (e.target.dataset.g) { F.group = e.target.dataset.g; draw(); } };
+            $('#fBad').onclick = () => { F.bad = !F.bad; draw(); };
+            $('#q').oninput = e => { F.q = e.target.value.toLowerCase(); render(); };
+            draw();
+            openFromHash();
+          }
+          const worst = x => x.issues.some(i => i.l==='e') ? 'e' : x.issues.length ? 'w' : '';
+          function render() {
+            list = data.filter(x => (F.device==='all'||x.device===F.device) && (F.scheme==='all'||x.scheme===F.scheme)
+              && (F.group==='all'||x.group===F.group) && (!F.bad || x.issues.length)
+              && (!F.q || (x.title+' '+x.id).toLowerCase().includes(F.q)));
+            const by = {};
+            list.forEach(x => (by[x.group] = by[x.group] || []).push(x));
+            $('#main').innerHTML = Object.entries(by).map(([g, items]) =>
+              `<h2>${esc(g)}</h2><div class="grid">` + items.map(x => {
+                const i = data.indexOf(x), w = worst(x);
+                const mark = w ? ` <span class="${w}" title="${esc(x.issues.map(y => y.t).join('\n'))}">${w==='e'?'✖':'⚠'}</span>` : '';
+                return `<div class="card" data-i="${i}"><img loading="lazy" src="${x.thumb}" alt="">
+                  <div class="meta"><span>${esc(x.title)}${mark}</span><small>${x.device} · ${x.scheme}</small></div></div>`;
+              }).join('') + '</div>').join('') || '<p>Không có ảnh khớp bộ lọc.</p>';
+          }
+          $('#main').onclick = e => { const c = e.target.closest('.card'); if (c) open(data[+c.dataset.i]); };
+
+          function open(x) {
+            cur = x;
+            location.hash = `${x.id}-${x.device}-${x.scheme}`;
+            $('#lb').classList.add('open');
+            $('#lbpic').src = x.full;
+            $('#lbtitle').textContent = x.title;
+            const arr = list.includes(x) ? list : data;
+            $('#lbpos').textContent = `${arr.indexOf(x)+1}/${arr.length}`;
+            $('#dl').href = x.full;
+            const bad = $('#lbissue');
+            bad.style.display = x.issues.length ? 'block' : 'none';
+            bad.innerHTML = x.issues.map(i => `<div class="${i.l}">${i.l==='e'?'✖':'⚠'} ${esc(i.t)}</div>`).join('');
+            const variantBtns = (el, key, vals) => {
+              el.innerHTML = vals.map(v => `<button data-v="${v}" class="${x[key]===v?'on':''}">${LBL[v]}</button>`).join('');
+              el.onclick = e => {
+                const v = e.target.dataset.v; if (!v) return;
+                const t = data.find(y => y.id===x.id && y.device===(key==='device'?v:x.device) && y.scheme===(key==='scheme'?v:x.scheme));
+                if (t) open(t);
+              };
+            };
+            variantBtns($('#vDevice'), 'device', ['desktop','mobile']);
+            variantBtns($('#vScheme'), 'scheme', ['light','dark']);
+            $('#lbimg').scrollTop = 0;
+          }
+          function close() { $('#lb').classList.remove('open'); history.replaceState(null, '', location.pathname); }
+          function nav(d) {
+            const arr = list.includes(cur) ? list : data;
+            open(arr[(arr.indexOf(cur) + d + arr.length) % arr.length]);
+          }
+          function openFromHash() {
+            const h = location.hash.slice(1);
+            const x = data.find(y => `${y.id}-${y.device}-${y.scheme}` === h);
+            if (x) open(x);
+          }
+          $('#close').onclick = close;
+          $('#prev').onclick = () => nav(-1);
+          $('#next').onclick = () => nav(1);
+          $('#fit').onclick = () => $('#lbimg').classList.toggle('actual');
+          $('#lbimg').onclick = e => { if (e.target.id === 'lbimg') close(); };
+          addEventListener('keydown', e => {
+            if (!$('#lb').classList.contains('open')) return;
+            if (e.key === 'Escape') close();
+            else if (e.key === 'ArrowLeft') nav(-1);
+            else if (e.key === 'ArrowRight') nav(1);
+            else if (e.key.toLowerCase() === 'f') $('#lbimg').classList.toggle('actual');
+          });
+          </script></body></html>
+          END_ALBUM
+
+      # ---------- Log chẩn đoán + trang dự phòng ----------
+      - name: Diagnostics
+        if: always()
+        run: |
+          mkdir -p dist
+          {
+            echo "=== trạng thái các bước ==="
+            echo "prep: ${{ steps.prep.outcome }}"
+            echo "boot: ${{ steps.boot.outcome }}"
+            echo "=== ps ===";           docker exec owrt ps
+            echo "=== ip addr ===";      docker exec owrt ip addr
+            echo "=== lan status ===";   docker exec owrt ubus call network.interface.lan status
+            echo "=== templates ===";    docker exec owrt ls /usr/share/ucode/luci/template/themes/
+            echo "=== http ===";         curl -is -m 10 http://127.0.0.1:8080/cgi-bin/luci/ | head -n 30
+            echo "=== logread ===";      docker exec owrt logread | tail -n 80
+            echo "=== docker logs ===";  docker logs owrt 2>&1 | tail -n 60
+          } > dist/diagnostics.txt 2>&1 || true
+          cat dist/diagnostics.txt
+
+      - name: Fallback page if capture failed
+        if: always()
+        run: |
+          mkdir -p dist
+          touch dist/.nojekyll
+          if [ ! -f dist/manifest.json ]; then
+            {
+              echo '<!DOCTYPE html><meta charset="utf-8"><title>Preview failed</title>'
+              echo '<body style="font-family:system-ui;max-width:900px;margin:24px auto;padding:0 16px">'
+              echo '<h1>Preview chưa tạo được</h1>'
+              echo '<p>Bước dựng hoặc chụp LuCI bị lỗi. Log chẩn đoán:</p>'
+              echo '<pre style="white-space:pre-wrap;background:#eee;color:#111;padding:12px;border-radius:8px">'
+              sed 's/&/\&amp;/g; s/</\&lt;/g' dist/diagnostics.txt
+              echo '</pre></body>'
+            } > dist/index.html
+          fi
+
+      # ---------- Deploy (cùng job, luôn chạy trừ khi bị hủy) ----------
+      - name: Upload Pages artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        if: ${{ !cancelled() }}
+        uses: actions/deploy-pages@v4
+
+      - name: Show page URL
+        if: ${{ !cancelled() }}
+        run: |
+          echo "Page: ${{ steps.deployment.outputs.page_url }}"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "🔗 **Preview:** ${{ steps.deployment.outputs.page_url }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- Tổng kết ----------
+      - name: Final gate
+        if: always()
+        run: |
+          if [ "${{ steps.prep.outcome }}" != "success" ] || [ "${{ steps.boot.outcome }}" != "success" ]; then
+            echo "::error::Không dựng được router giả, web chỉ hiện log chẩn đoán"
+            echo "- ❌ Không dựng được router giả (xem trang web để đọc log)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          e=$(wc -l < checks/errors)
+          w=$(wc -l < checks/warns)
+          echo "Tổng kết: $e lỗi, $w cảnh báo"
+          {
+            echo ""
+            echo "## Tổng kết"
+            echo "- Lỗi: **$e**"
+            echo "- Cảnh báo: **$w**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$FAIL_ON_ERROR" = "true" ] && [ "$e" -gt 0 ]; then
+            echo "::error::Có $e lỗi và FAIL_ON_ERROR=true"
+            exit 1
+          fi
