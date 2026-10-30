@@ -36,31 +36,39 @@ jobs:
           mkdir -p build/luci-static/material3
           npx sass styles/cascade.scss build/luci-static/material3/cascade.css --no-source-map
 
-      - name: Start OpenWrt container
+      - name: Start OpenWrt container and install LuCI
         run: |
-          docker run -d --name owrt --privileged -p 8080:80 "$OWRT_IMAGE" /sbin/init
-          sleep 8
-          docker exec owrt mkdir -p /var/lock /var/run
-          # Image chưa có SSL cho uclient-fetch -> dùng http (gói vẫn được ký bằng usign)
+          docker run -d --name owrt -p 8080:80 "$OWRT_IMAGE" sleep infinity
+          docker exec owrt mkdir -p /var/lock /var/run/ubus
+          docker exec owrt cat /etc/resolv.conf
           docker exec owrt sed -i 's#https://#http://#g' /etc/opkg/distfeeds.conf
           docker exec owrt sh -c 'opkg update && opkg install luci'
 
-      - name: Install theme into OpenWrt
+      - name: Install theme and start LuCI services
         run: |
           docker cp htdocs/. owrt:/www/
           docker cp build/luci-static/material3/cascade.css owrt:/www/luci-static/material3/cascade.css
           docker exec owrt mkdir -p /usr/share/ucode/luci/template/themes
           docker cp ucode/template/themes/material3 owrt:/usr/share/ucode/luci/template/themes/
           docker cp root/. owrt:/ || true
+
           docker exec owrt sh -c '
             uci set luci.themes.Material3=/luci-static/material3
             uci set luci.main.mediaurlbase=/luci-static/material3
             uci commit luci
             printf "root\nroot\n" | passwd root
             rm -rf /tmp/luci-*
-            /etc/init.d/rpcd restart
-            /etc/init.d/uhttpd restart
           '
+
+          # Tự bật daemon, không dùng procd/init
+          docker exec -d owrt ubusd -s /var/run/ubus/ubus.sock
+          sleep 2
+          docker exec -d owrt rpcd -s /var/run/ubus/ubus.sock
+          docker exec -d owrt logd
+          sleep 2
+          docker exec -d owrt uhttpd -f -h /www -r OpenWrt -x /cgi-bin \
+            -u /ubus -U /var/run/ubus/ubus.sock \
+            -t 60 -T 30 -k 20 -A 1 -n 3 -N 100 -R -p 0.0.0.0:80
 
       - name: Wait for LuCI
         run: |
