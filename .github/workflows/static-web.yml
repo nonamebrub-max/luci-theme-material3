@@ -163,7 +163,7 @@ jobs:
             esac
           done
 
-      # ---------- Chuẩn bị image OpenWrt (mạng Docker còn nguyên, chưa chạy init) ----------
+      # ---------- Chuẩn bị image OpenWrt ----------
       - name: Prepare OpenWrt image
         id: prep
         continue-on-error: true
@@ -184,7 +184,7 @@ jobs:
           docker cp ucode/template/themes/material3 prep:/usr/share/ucode/luci/template/themes/
           docker cp root/. prep:/ || true
 
-          # Mạng giả lập: 2 bridge rỗng, không đụng eth0 của Docker
+          # Cấu hình mạng: khai báo eth0 là unmanaged để OpenWrt không xóa IP của Docker
           cat > network.conf <<'END_NET'
           config interface 'loopback'
               option device 'lo'
@@ -194,6 +194,10 @@ jobs:
 
           config globals 'globals'
               option ula_prefix 'fd12:3456:789a::/48'
+
+          config interface 'docker'
+              option device 'eth0'
+              option proto 'unmanaged'
 
           config device
               option name 'br-lan'
@@ -286,27 +290,8 @@ jobs:
         if: steps.prep.outcome == 'success'
         continue-on-error: true
         run: |
+          # eth0 giờ đã là 'unmanaged', OpenWrt sẽ không xóa IP của nó nữa
           docker run -d --name owrt --privileged -p 8080:80 owrt-prepared /sbin/init
-
-          # init hay kéo eth0 xuống -> giữ lại địa chỉ và route Docker cấp
-          CIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' owrt)
-          CPF=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPPrefixLen}}{{end}}' owrt)
-          CGW=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' owrt)
-          echo "container eth0: $CIP/$CPF via $CGW"
-
-          cat > keep_eth0.sh <<EOF
-          #!/bin/sh
-          while true; do
-            ip link set eth0 up 2>/dev/null
-            ip addr show eth0 2>/dev/null | grep -q "$CIP/" || ip addr replace $CIP/$CPF dev eth0 2>/dev/null
-            ip route show default 2>/dev/null | grep -q "via $CGW" || ip route replace default via $CGW dev eth0 metric 500 2>/dev/null
-            sleep 2
-          done
-          EOF
-          docker cp keep_eth0.sh owrt:/tmp/keep_eth0.sh
-          
-          # Thực thi script giữ IP ngầm trong container thay vì chạy vòng lặp ngoài host
-          docker exec -d owrt sh /tmp/keep_eth0.sh
 
           sleep 10
           docker exec owrt ubus -t 60 wait_for system network.interface || true
