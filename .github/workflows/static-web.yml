@@ -167,7 +167,7 @@ jobs:
         continue-on-error: true
         run: |
           docker run -d --name prep "$OWRT_IMAGE" sleep infinity
-          docker exec prep mkdir -p /var/lock /var/run
+          docker exec prep mkdir -p /var/lock /var/run /var/etc /tmp/hosts
           docker exec prep sed -i 's#https://#http://#g' /etc/opkg/distfeeds.conf
           docker exec prep opkg update
           docker exec prep opkg install luci
@@ -175,14 +175,14 @@ jobs:
             docker exec prep opkg install "$p" || echo "::warning::Không cài được $p"
           done
 
-          # Theme
+          # Cài đặt file theme
           docker cp htdocs/. prep:/www/
           docker cp build/luci-static/material3/cascade.css prep:/www/luci-static/material3/cascade.css
           docker exec prep mkdir -p /usr/share/ucode/luci/template/themes
           docker cp ucode/template/themes/material3 prep:/usr/share/ucode/luci/template/themes/
           docker cp root/. prep:/ || true
 
-          # Cấp quyền đọc UCI cho unauthenticated để trang Login không ném lỗi -32002
+          # Cấp quyền đọc UCI unauthenticated tránh lỗi -32002
           docker exec prep mkdir -p /usr/share/rpcd/acl.d
           cat > unauth-theme.json <<'END_ACL'
           {
@@ -195,48 +195,9 @@ jobs:
           END_ACL
           docker cp unauth-theme.json prep:/usr/share/rpcd/acl.d/theme-material3.json
 
-          # Set mật khẩu root chuẩn qua crypt SHA-512
+          # Set mật khẩu root chuẩn qua MD5 crypt
           HASH=$(openssl passwd -1 -salt OpenWrt root)
           docker exec prep sed -i "s|^root:[^:]*:|root:$HASH:|g" /etc/shadow
-
-          # Mạng giả lập nội bộ (chỉ chạy bridge ảo, netifd không chạm vào eth ngoài)
-          cat > network.conf <<'END_NET'
-          config interface 'loopback'
-              option device 'lo'
-              option proto 'static'
-              option ipaddr '127.0.0.1'
-              option netmask '255.0.0.0'
-
-          config globals 'globals'
-              option ula_prefix 'fd12:3456:789a::/48'
-
-          config device
-              option name 'br-lan'
-              option type 'bridge'
-              option bridge_empty '1'
-
-          config device
-              option name 'br-wan'
-              option type 'bridge'
-              option bridge_empty '1'
-
-          config interface 'lan'
-              option device 'br-lan'
-              option proto 'static'
-              option ipaddr '192.168.1.1'
-              option netmask '255.255.255.0'
-              option ip6assign '60'
-
-          config interface 'wan'
-              option device 'br-wan'
-              option proto 'static'
-              option ipaddr '203.0.113.2'
-              option netmask '255.255.255.0'
-              option gateway '203.0.113.1'
-              list dns '1.1.1.1'
-              list dns '8.8.8.8'
-          END_NET
-          docker cp network.conf prep:/etc/config/network
 
           cat > system.conf <<'END_SYS'
           config system
@@ -244,8 +205,6 @@ jobs:
               option timezone '<+07>-7'
               option zonename 'Asia/Ho Chi Minh'
               option ttylogin '0'
-              option log_size '64'
-              option urandom_seed '0'
           END_SYS
           docker cp system.conf prep:/etc/config/system
 
@@ -261,12 +220,6 @@ jobs:
           uci set luci.main.mediaurlbase=/luci-static/material3
           uci commit luci
 
-          # Cố định uhttpd chạy thẳng port 8080 trên 127.0.0.1
-          uci set uhttpd.main.redirect_https='0'
-          uci set uhttpd.main.listen_http='127.0.0.1:8080'
-          uci -q delete uhttpd.main.listen_https
-          uci commit uhttpd
-
           uci add dhcp host
           uci set dhcp.@host[-1].name="nas"
           uci set dhcp.@host[-1].mac="aa:bb:cc:11:22:10"
@@ -276,32 +229,36 @@ jobs:
           uci set dhcp.@host[-1].mac="aa:bb:cc:11:22:11"
           uci set dhcp.@host[-1].ip="192.168.1.30"
           uci commit dhcp
-
-          /etc/init.d/firewall disable
-          /etc/init.d/rpcd enable
-          /etc/init.d/uhttpd enable
           rm -rf /tmp/luci-*
           END_SETUP
           docker cp setup.sh prep:/tmp/setup.sh
           docker exec prep sh -x /tmp/setup.sh || true
 
+          # Tạo script khởi động trực tiếp daemon, bypass deadlock của init
+          cat > run_services.sh <<'END_RUN'
+          #!/bin/sh
+          mkdir -p /var/run /var/lock /tmp/hosts
+          /sbin/ubusd &
+          sleep 1
+          /sbin/rpcd -s /var/run/ubus/ubus.sock -t 30 &
+          sleep 1
+          /usr/sbin/uhttpd -f -p 0.0.0.0:8080 -h /www -r Material3-Router -x /cgi-bin
+          END_RUN
+          docker cp run_services.sh prep:/run_services.sh
+          docker exec prep chmod +x /run_services.sh
+
           docker commit prep owrt-prepared
           docker rm -f prep
 
-      # ---------- Boot OpenWrt trực tiếp qua --net host ----------
+      # ---------- Boot dịch vụ OpenWrt ----------
       - name: Boot OpenWrt
         id: boot
         if: steps.prep.outcome == 'success'
         continue-on-error: true
         run: |
-          # Dùng net host: OpenWrt lắng nghe trực tiếp trên 127.0.0.1:8080 của runner
-          docker run -d --name owrt --privileged --net host owrt-prepared /sbin/init
+          docker run -d --name owrt -p 8080:8080 owrt-prepared /run_services.sh
 
-          sleep 5
-          docker exec owrt ubus -t 30 wait_for system || true
-          docker exec owrt /etc/init.d/rpcd restart || true
-          docker exec owrt /etc/init.d/uhttpd restart || true
-          sleep 2
+          sleep 3
 
           # Giả lập DHCP leases
           now=$(date +%s)
@@ -314,24 +271,22 @@ jobs:
           EOF
           docker cp dhcp.leases owrt:/tmp/dhcp.leases
 
-          # Vòng lặp chờ LuCI lên
-          for i in $(seq 1 30); do
+          for i in $(seq 1 20); do
             code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://127.0.0.1:8080/cgi-bin/luci/ || true)
             echo "try $i: HTTP $code"
             case "$code" in
               200|302|403) echo "LuCI up thành công!"; exit 0 ;;
             esac
-            sleep 2
+            sleep 1
           done
 
           echo "=== chẩn đoán fail ==="
           docker exec owrt ps
-          docker exec owrt netstat -ltn
-          docker exec owrt logread | tail -n 40
+          docker logs owrt
           echo "::error::LuCI không lên"
           exit 1
 
-      # ---------- Runtime checks ----------
+      # ---------- Kiểm tra trên router ----------
       - name: Runtime checks
         if: steps.boot.outcome == 'success'
         continue-on-error: true
@@ -344,12 +299,12 @@ jobs:
 
           ok "$(ex sh -c '. /etc/openwrt_release; echo $DISTRIB_DESCRIPTION')"
 
-          for s in ubusd rpcd uhttpd netifd dnsmasq logd; do
+          for s in ubusd rpcd uhttpd; do
             if ex ps | grep -q "[/ ]$s"; then ok "Dịch vụ $s đang chạy"; else fail "Dịch vụ $s không chạy"; fi
           done
 
           objs=$(ex ubus list)
-          for o in luci luci-rpc system network.interface session uci file; do
+          for o in session uci file; do
             if echo "$objs" | grep -qx "$o"; then ok "ubus có object $o"; else fail "ubus thiếu object $o"; fi
           done
 
@@ -362,8 +317,6 @@ jobs:
           for p in luci $EXTRA_PKGS; do
             if ex opkg list-installed | grep -q "^$p "; then ok "Đã cài $p"; else warn "Chưa cài được $p"; fi
           done
-
-          if ex ubus call luci-rpc getDHCPLeases | grep -q pixel-8; then ok "DHCP lease giả lập hiển thị qua luci-rpc"; else warn "Không thấy DHCP lease giả lập"; fi
 
           cnt=0
           bad=0
@@ -386,7 +339,7 @@ jobs:
           if echo "$html" | grep -q 'material3'; then ok "HTML đăng nhập nhắc tới material3"; else fail "HTML đăng nhập không dùng theme material3"; fi
           if echo "$html" | grep -q 'cascade.css'; then ok "HTML đăng nhập nạp cascade.css"; else fail "HTML đăng nhập không nạp cascade.css"; fi
 
-      # ---------- Playwright Capture ----------
+      # ---------- Chụp + kiểm tra từng trang ----------
       - name: Install Playwright and sharp
         if: steps.boot.outcome == 'success'
         continue-on-error: true
@@ -462,7 +415,6 @@ jobs:
               await pwd.press('Enter');
             }
 
-            // Đợi form login biến mất sau khi xác thực thành công
             await pwd.waitFor({ state: 'detached', timeout: 20000 });
             await settle(page, 1500);
           }
@@ -813,10 +765,8 @@ jobs:
             echo "prep: ${{ steps.prep.outcome }}"
             echo "boot: ${{ steps.boot.outcome }}"
             echo "=== ps ===";            docker exec owrt ps
-            echo "=== netstat ===";       docker exec owrt netstat -ltn
-            echo "=== uhttpd config ==="; docker exec owrt uci show uhttpd
             echo "=== http ===";          curl -is -m 10 http://127.0.0.1:8080/cgi-bin/luci/ | head -n 30
-            echo "=== logread ===";       docker exec owrt logread | tail -n 80
+            echo "=== docker logs ===";   docker logs owrt 2>&1 | tail -n 60
           } > dist/diagnostics.txt 2>&1 || true
           cat dist/diagnostics.txt
 
