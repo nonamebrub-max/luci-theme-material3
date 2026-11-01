@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Theme preview</title>
+<style>
+:root{--bg:#fef7ff;--sf:#f3edf7;--fg:#1d1b20;--mut:#49454f;--pri:#6750a4;--onpri:#fff;--bd:#cac4d0;--warn:#b26a00;--err:#b3261e}
+@media(prefers-color-scheme:dark){:root{--bg:#141218;--sf:#211f26;--fg:#e6e0e9;--mut:#cac4d0;--pri:#d0bcff;--onpri:#381e72;--bd:#49454f;--warn:#ffb951;--err:#f2b8b5}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--bd);padding:12px 20px}
+h1{font-size:20px;margin:0 0 2px}
+#meta,#sum{color:var(--mut);font-size:13px}
+#sum{margin-bottom:8px}
+details{margin:6px 0;font-size:13px;color:var(--mut)}
+details div{margin:2px 0}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.seg{display:inline-flex;border:1px solid var(--bd);border-radius:20px;overflow:hidden}
+button{font:inherit;color:var(--fg);background:none;border:0;padding:6px 14px;cursor:pointer}
+.seg button.on,.chip.on{background:var(--pri);color:var(--onpri)}
+.chip{border:1px solid var(--bd);border-radius:16px;padding:4px 12px}
+input[type=search]{font:inherit;color:var(--fg);background:var(--sf);border:1px solid var(--bd);border-radius:20px;padding:6px 14px}
+main{padding:8px 20px 40px}
+h2{font-size:15px;color:var(--mut);margin:24px 0 10px;text-transform:uppercase;letter-spacing:.06em}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
+.card{background:var(--sf);border-radius:16px;overflow:hidden;cursor:pointer;border:2px solid transparent}
+.card:hover{border-color:var(--pri)}
+.card img{width:100%;aspect-ratio:4/3;object-fit:cover;object-position:top;display:block;background:var(--bd)}
+.meta{padding:8px 12px;display:flex;justify-content:space-between;gap:8px;font-size:13px}
+.meta small{color:var(--mut)}
+.e{color:var(--err);font-weight:700}
+.w{color:var(--warn);font-weight:700}
+#lb{position:fixed;inset:0;background:#000e;display:none;flex-direction:column;z-index:10;color:#fff}
+#lb.open{display:flex}
+.lbbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;background:#000a}
+.lbbar button{color:#fff;border:1px solid #fff4;border-radius:16px}
+.lbbar .seg button.on{background:#fff;color:#000}
+.lbbar .sp{flex:1}
+.lbimg{flex:1;overflow:auto;text-align:center;padding:12px}
+.lbimg img{max-width:100%;height:auto;border-radius:8px;background:#fff1}
+.lbimg.actual img{max-width:none}
+#lbissue{max-height:25vh;overflow:auto;padding:8px 14px;background:#2b1b1b;font-size:13px;display:none}
+#lbissue div{margin:2px 0}
+footer{padding:0 20px 24px;color:var(--mut);font-size:13px}
+a{color:inherit}
+</style></head><body>
+<header>
+  <h1 id="title">Theme preview</h1>
+  <div id="meta"></div>
+  <div id="sum"></div>
+  <details id="st" style="display:none"><summary>Kiểm tra tĩnh của theme</summary><div id="stlist"></div></details>
+  <div class="bar">
+    <span id="fTheme" class="bar"></span>
+    <span class="seg" id="fDevice"></span>
+    <span class="seg" id="fScheme"></span>
+    <span id="fGroup" class="bar"></span>
+    <button class="chip" id="fBad">Chỉ trang có vấn đề</button>
+    <input type="search" id="q" placeholder="Tìm trang...">
+  </div>
+</header>
+<main id="main"></main>
+<footer>Phím tắt trong ảnh lớn: ← → chuyển ảnh · L đổi sáng/tối · M đổi desktop/mobile · F phóng to · Esc đóng · <a href="diagnostics.txt">chẩn đoán</a> · <a href="build.log">log build</a> · <a href="../">tất cả preview</a></footer>
+<div id="lb">
+  <div class="lbbar">
+    <button id="prev">←</button><button id="next">→</button>
+    <strong id="lbtitle"></strong><span id="lbpos" style="opacity:.7"></span>
+    <span class="seg" id="vDevice"></span><span class="seg" id="vScheme"></span>
+    <span class="sp"></span>
+    <button id="fit">Kích thước thật (F)</button>
+    <a id="dl" download><button>Tải về</button></a>
+    <button id="close">✕</button>
+  </div>
+  <div id="lbissue"></div>
+  <div class="lbimg" id="lbimg"><img id="lbpic" alt="" decoding="async"></div>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const LBL = {all:'Tất cả',desktop:'Desktop',mobile:'Mobile',light:'Sáng',dark:'Tối'};
+let M = null, data = [], list = [], cur = null;
+const F = {theme:'', device:'desktop', scheme:'light', group:'all', q:'', bad:false};
+
+fetch('manifest.json').then(r => r.json()).then(d => { M = d; data = d.items; F.theme = (d.meta.themes[0] || {}).name || ''; head(d); init(); });
+
+function head(d) {
+  const m = d.meta, s = d.summary;
+  document.title = (m.title || m.name || m.repo) + ' · preview';
+  $('#title').textContent = (m.title || m.name || m.repo) + ' — preview từ LuCI thật';
+  $('#meta').innerHTML = `<a href="https://github.com/${esc(m.repo)}" target="_blank" rel="noopener">${esc(m.repo)}</a>`
+    + (m.ref ? ' @ ' + esc(m.ref.slice(0, 40)) : '') + (m.sha ? ' · ' + esc(m.sha.slice(0, 8)) : '')
+    + (m.pkgPath && m.pkgPath !== '.' ? ' · ' + esc(m.pkgPath) : '')
+    + ` · giả lập ${esc(m.model)} · ${esc(m.os || '')}`;
+  $('#sum').innerHTML = `${s.total} ảnh · <span class="e">${s.errors} lỗi</span> · <span class="w">${s.warns} cảnh báo</span>`
+    + ` · tĩnh: <span class="e">${s.staticErrors}</span>/<span class="w">${s.staticWarns}</span>`
+    + (s.darkSame ? ' · <span class="w">dark mode gần như không đổi màu nền</span>' : '')
+    + ` · ${new Date(m.generated).toLocaleString('vi-VN')}`;
+  const items = [...(d.static || []), ...(m.notes || []).map(t => ({l:'n', t}))];
+  if (items.length) {
+    $('#st').style.display = 'block';
+    $('#stlist').innerHTML = items.map(i => `<div class="${i.l==='e'?'e':i.l==='w'?'w':''}">${i.l==='e'?'✖':i.l==='w'?'⚠':'ℹ'} ${esc(i.t)}</div>`).join('');
+  }
+}
+function seg(el, key, vals, onPick) {
+  el.innerHTML = vals.map(v => `<button data-v="${v}" class="${F[key]===v?'on':''}">${LBL[v]||v}</button>`).join('');
+  el.onclick = e => { const v = e.target.dataset.v; if (v) { F[key] = v; onPick(); } };
+}
+function init() {
+  const groups = ['all', ...new Set(data.map(x => x.group))];
+  const themes = M.meta.themes.map(t => t.name);
+  const draw = () => {
+    $('#fTheme').innerHTML = themes.length > 1 ? themes.map(t => `<button class="chip ${F.theme===t?'on':''}" data-t="${t}">${esc(t)}</button>`).join('') : '';
+    seg($('#fDevice'), 'device', ['all','desktop','mobile'], draw);
+    seg($('#fScheme'), 'scheme', ['all','light','dark'], draw);
+    $('#fGroup').innerHTML = groups.map(g => `<button class="chip ${F.group===g?'on':''}" data-g="${g}">${g==='all'?'Tất cả nhóm':g}</button>`).join('');
+    $('#fBad').classList.toggle('on', F.bad);
+    render();
+  };
+  $('#fTheme').onclick = e => { if (e.target.dataset.t) { F.theme = e.target.dataset.t; draw(); } };
+  $('#fGroup').onclick = e => { if (e.target.dataset.g) { F.group = e.target.dataset.g; draw(); } };
+  $('#fBad').onclick = () => { F.bad = !F.bad; draw(); };
+  $('#q').oninput = e => { F.q = e.target.value.toLowerCase(); render(); };
+  draw();
+  openFromHash();
+}
+const worst = x => x.issues.some(i => i.l==='e') ? 'e' : x.issues.length ? 'w' : '';
+function render() {
+  list = data.filter(x => (!F.theme || x.theme===F.theme) && (F.device==='all'||x.device===F.device) && (F.scheme==='all'||x.scheme===F.scheme)
+    && (F.group==='all'||x.group===F.group) && (!F.bad || x.issues.length)
+    && (!F.q || (x.title+' '+x.id).toLowerCase().includes(F.q)));
+  const by = {};
+  list.forEach(x => (by[x.group] = by[x.group] || []).push(x));
+  $('#main').innerHTML = Object.entries(by).map(([g, items]) =>
+    `<h2>${esc(g)}</h2><div class="grid">` + items.map(x => {
+      const i = data.indexOf(x), w = worst(x);
+      const mark = w ? ` <span class="${w}" title="${esc(x.issues.map(y => y.t).join('\n'))}">${w==='e'?'✖':'⚠'}</span>` : '';
+      return `<div class="card" data-i="${i}"><img loading="lazy" src="${x.thumb}" alt="">
+        <div class="meta"><span>${esc(x.title)}${mark}</span><small>${x.device} · ${x.scheme}</small></div></div>`;
+    }).join('') + '</div>').join('') || '<p>Không có ảnh khớp bộ lọc.</p>';
+}
+$('#main').onclick = e => { const c = e.target.closest('.card'); if (c) open(data[+c.dataset.i]); };
+
+const key = x => [x.theme, x.id, x.device, x.scheme].join('.');
+function variant(x, k, v) {
+  return data.find(y => y.theme===x.theme && y.id===x.id && y.device===(k==='device'?v:x.device) && y.scheme===(k==='scheme'?v:x.scheme));
+}
+function open(x) {
+  cur = x;
+  location.hash = key(x);
+  $('#lb').classList.add('open');
+  $('#lbpic').src = x.full;
+  $('#lbtitle').textContent = x.title + (M.meta.themes.length > 1 ? ' · ' + x.theme : '');
+  const arr = list.includes(x) ? list : data;
+  const n = arr.length, i = arr.indexOf(x);
+  $('#lbpos').textContent = `${i+1}/${n}`;
+  $('#dl').href = x.full;
+  [arr[(i+1)%n], arr[(i-1+n)%n]].forEach(y => { if (y) new Image().src = y.full; });
+  const bad = $('#lbissue');
+  bad.style.display = x.issues.length ? 'block' : 'none';
+  bad.innerHTML = x.issues.map(it => `<div class="${it.l}">${it.l==='e'?'✖':'⚠'} ${esc(it.t)}</div>`).join('');
+  const btns = (el, k, vals) => {
+    el.innerHTML = vals.map(v => `<button data-v="${v}" class="${x[k]===v?'on':''}">${LBL[v]}</button>`).join('');
+    el.onclick = e => { const v = e.target.dataset.v; if (!v) return; const t = variant(x, k, v); if (t) open(t); };
+  };
+  btns($('#vDevice'), 'device', ['desktop','mobile']);
+  btns($('#vScheme'), 'scheme', ['light','dark']);
+  $('#lbimg').scrollTop = 0;
+}
+function close() { $('#lb').classList.remove('open'); history.replaceState(null, '', location.pathname); }
+function nav(d) {
+  const arr = list.includes(cur) ? list : data;
+  open(arr[(arr.indexOf(cur) + d + arr.length) % arr.length]);
+}
+function flip(k) {
+  const v = k === 'device' ? (cur.device === 'desktop' ? 'mobile' : 'desktop') : (cur.scheme === 'light' ? 'dark' : 'light');
+  const t = variant(cur, k, v);
+  if (t) open(t);
+}
+function openFromHash() {
+  const h = location.hash.slice(1);
+  const x = data.find(y => key(y) === h);
+  if (x) { F.theme = x.theme; open(x); }
+}
+$('#close').onclick = close;
+$('#prev').onclick = () => nav(-1);
+$('#next').onclick = () => nav(1);
+$('#fit').onclick = () => $('#lbimg').classList.toggle('actual');
+$('#lbimg').onclick = e => { if (e.target.id === 'lbimg') close(); };
+let tx = null;
+$('#lbimg').addEventListener('touchstart', e => { tx = e.touches[0].clientX; }, {passive:true});
+$('#lbimg').addEventListener('touchend', e => {
+  if (tx === null) return;
+  const dx = e.changedTouches[0].clientX - tx; tx = null;
+  if (Math.abs(dx) > 70 && !$('#lbimg').classList.contains('actual')) nav(dx < 0 ? 1 : -1);
+}, {passive:true});
+addEventListener('keydown', e => {
+  if (!$('#lb').classList.contains('open')) return;
+  const k = e.key.toLowerCase();
+  if (e.key === 'Escape') close();
+  else if (e.key === 'ArrowLeft') nav(-1);
+  else if (e.key === 'ArrowRight') nav(1);
+  else if (k === 'f') $('#lbimg').classList.toggle('actual');
+  else if (k === 'l') flip('scheme');
+  else if (k === 'm') flip('device');
+});
+</script></body></html>

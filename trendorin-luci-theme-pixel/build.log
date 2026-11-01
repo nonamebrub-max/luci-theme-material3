@@ -1,0 +1,11 @@
+[ok] Gói theme: .
+[w] Makefile không include luci.mk
+[ok] Không có SCSS, dùng CSS có sẵn trong repo
+[ok] ucode/template/themes/pixel/header.ut
+[ok] ucode/template/themes/pixel/footer.ut
+[ok] htdocs/luci-static/pixel/cascade.css: 67992 byte
+[ok] htdocs/luci-static/pixel/cascade.css có 1 khối @font-face
+[ok] htdocs/luci-static/pixel/cascade.css có selector dark mode riêng
+[ok] htdocs/luci-static/pixel/cascade.css: 7 url() đều trỏ tới file có thật
+[ok] Đã kiểm tra cú pháp 2 file JS
+[ok] uci-defaults/30_luci-theme-pixel đúng cú pháp

@@ -1,0 +1,455 @@
+=== repo: Trendorin/luci-theme-pixel ref:  subdir:  ===
+=== trạng thái các bước ===
+bundle:     success
+base_load:  skipped
+base_build: success
+boot:       success
+theme:      success
+ready:      success
+=== base_build.log (60 dòng cuối) ===
+Configuring libiptext0.
+Configuring iptables-mod-ipopt.
+Configuring libip4tc2.
+Configuring tc-tiny.
+Configuring libip6tc2.
+Configuring libiptext6-0.
+Configuring xtables-legacy.
+Configuring iptables-zz-legacy.
+Configuring sqm-scripts.
+Configuring luci-app-sqm.
+Installing luci-app-upnp (26.301.70438~aa4865e) to root...
+Failed to connect to ubus
+Collected errors:
+ * pkg_hash_check_unresolved: cannot find dependency kmod-nft-compat for xtables-nft
+ * pkg_hash_fetch_best_installation_candidate: Packages for xtables-nft found, but incompatible with the architectures configured
+ * pkg_hash_check_unresolved: cannot find dependency kmod-ip6tables for ip6tables-nft
+ * pkg_hash_check_unresolved: cannot find dependency kmod-ipt-core for xtables-legacy
+ * pkg_hash_fetch_best_installation_candidate: Packages for xtables-legacy found, but incompatible with the architectures configured
+ * pkg_hash_check_unresolved: cannot find dependency kmod-ip6tables for ip6tables-zz-legacy
+ * pkg_hash_fetch_best_installation_candidate: Packages for ip6tables found, but incompatible with the architectures configured
+ * pkg_hash_check_unresolved: cannot find dependency kmod-ipt-core for iptables-nft
+ * pkg_hash_check_unresolved: cannot find dependency kmod-nf-conntrack-netlink for libnetfilter-conntrack3
+ * pkg_hash_fetch_best_installation_candidate: Packages for libnetfilter-conntrack3 found, but incompatible with the architectures configured
+Downloading http://downloads.openwrt.org/releases/24.10-SNAPSHOT/packages/x86_64/luci/luci-app-upnp_26.301.70438~aa4865e_all.ipk
+Installing libcap-ng (0.8.4-r1) to root...
+Downloading http://downloads.openwrt.org/releases/24.10-SNAPSHOT/packages/x86_64/packages/libcap-ng_0.8.4-r1_x86_64.ipk
+Installing miniupnpd-nftables (2.3.9-r1) to root...
+Downloading http://downloads.openwrt.org/releases/24.10-SNAPSHOT/packages/x86_64/packages/miniupnpd-nftables_2.3.9-r1_x86_64.ipk
+Configuring libcap-ng.
+Configuring miniupnpd-nftables.
+Configuring luci-app-upnp.
+Installing luci-app-ddns (26.301.70438~aa4865e) to root...
+Downloading http://downloads.openwrt.org/releases/24.10-SNAPSHOT/packages/x86_64/luci/luci-app-ddns_26.301.70438~aa4865e_all.ipk
+Installing ddns-scripts-services (2.8.2-r68) to root...
+Downloading http://downloads.openwrt.org/releases/24.10-SNAPSHOT/packages/x86_64/packages/ddns-scripts-services_2.8.2-r68_all.ipk
+Installing ddns-scripts (2.8.2-r68) to root...
+Downloading http://downloads.openwrt.org/releases/24.10-SNAPSHOT/packages/x86_64/packages/ddns-scripts_2.8.2-r68_all.ipk
+Configuring ddns-scripts-services.
+Configuring ddns-scripts.
+Configuring luci-app-ddns.
+ 050403  WARN : Service section disabled! - TERMINATE
+ 050403  WARN : Service section disabled! - TERMINATE
+ 050403  WARN : Service section disabled! - TERMINATE
+ 050403  WARN : Service section disabled! - TERMINATE
+Installing luci-app-wol (26.301.70438~aa4865e) to root...
+Downloading http://downloads.openwrt.org/releases/24.10-SNAPSHOT/packages/x86_64/luci/luci-app-wol_26.301.70438~aa4865e_all.ipk
+Installing etherwake (1.09-r5) to root...
+Downloading http://downloads.openwrt.org/releases/24.10-SNAPSHOT/packages/x86_64/packages/etherwake_1.09-r5_x86_64.ipk
+Configuring etherwake.
+Configuring luci-app-wol.
+Changing password for root
+New password: 
+Bad password: too short
+Retype password: 
+passwd: password for root changed by root
+cfg05fe63
+cfg06fe63
+cfg07f37d
+sha256:e5bb4eae39064f6c7ec6c1a0579e0a3538ba4e6cf8eea350f543254ab5b7c72a
+base
+=== build.log của theme (80 dòng cuối) ===
+[ok] Gói theme: .
+[w] Makefile không include luci.mk
+[ok] Không có SCSS, dùng CSS có sẵn trong repo
+[ok] ucode/template/themes/pixel/header.ut
+[ok] ucode/template/themes/pixel/footer.ut
+[ok] htdocs/luci-static/pixel/cascade.css: 67992 byte
+[ok] htdocs/luci-static/pixel/cascade.css có 1 khối @font-face
+[ok] htdocs/luci-static/pixel/cascade.css có selector dark mode riêng
+[ok] htdocs/luci-static/pixel/cascade.css: 7 url() đều trỏ tới file có thật
+[ok] Đã kiểm tra cú pháp 2 file JS
+[ok] uci-defaults/30_luci-theme-pixel đúng cú pháp
+=== docker ps ===
+CONTAINER ID   IMAGE       COMMAND              CREATED          STATUS          PORTS                                         NAMES
+6be50d6d071c   owrt-base   "/run_services.sh"   57 seconds ago   Up 56 seconds   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp   owrt
+=== ps ===
+  PID USER       VSZ STAT COMMAND
+    1 root      1228 S    /usr/sbin/uhttpd -f -p 0.0.0.0:8080 -h /www -r CR660
+   12 root      1196 S    {run_services.sh} /bin/sh /run_services.sh
+   29 root      1052 S    /sbin/ubusd -s /var/run/ubus/ubus.sock
+   37 logd      1584 S    /sbin/logd -S 64
+   38 root      2732 S    /sbin/rpcd -s /var/run/ubus/ubus.sock -t 30
+   53 root      1820 S    /sbin/netifd
+  814 root      1624 S    {dynamic_dns_upd} /bin/sh /usr/lib/ddns/dynamic_dns_
+ 2227 root      1192 S    sleep 60
+ 3140 root      1192 S    sleep 2
+ 3147 root      1200 R    ps
+=== ubus objects ===
+file
+iwinfo
+log
+luci
+luci-rpc
+luci.ddns
+luci.upnp
+network
+network.device
+network.interface
+network.interface.lan
+network.interface.loopback
+network.interface.wan
+network.rrdns
+network.wireless
+rc
+session
+system
+uci
+=== ip addr ===
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host 
+       valid_lft forever preferred_lft forever
+2: eth0@veth2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP 
+    link/ether a2:a2:a1:91:fb:16 brd ff:ff:ff:ff:ff:ff
+    inet 172.17.0.2/16 brd 172.17.255.255 scope global eth0
+       valid_lft forever preferred_lft forever
+3: veth0@lan1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP qlen 1000
+    link/ether e2:aa:10:c4:90:9c brd ff:ff:ff:ff:ff:ff
+    inet6 fe80::e0aa:10ff:fec4:909c/64 scope link 
+       valid_lft forever preferred_lft forever
+4: lan1@veth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master br-lan state UP qlen 1000
+    link/ether 82:ea:1f:16:33:cf brd ff:ff:ff:ff:ff:ff
+    inet6 fe80::80ea:1fff:fe16:33cf/64 scope link 
+       valid_lft forever preferred_lft forever
+5: veth1@lan2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP qlen 1000
+    link/ether f2:b2:01:8a:fe:db brd ff:ff:ff:ff:ff:ff
+    inet6 fe80::f0b2:1ff:fe8a:fedb/64 scope link 
+       valid_lft forever preferred_lft forever
+6: lan2@veth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master br-lan state UP qlen 1000
+    link/ether 42:5a:21:4e:9e:f5 brd ff:ff:ff:ff:ff:ff
+    inet6 fe80::405a:21ff:fe4e:9ef5/64 scope link 
+       valid_lft forever preferred_lft forever
+7: veth2@lan3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP qlen 1000
+    link/ether 26:52:f0:45:42:10 brd ff:ff:ff:ff:ff:ff
+    inet6 fe80::2452:f0ff:fe45:4210/64 scope link 
+       valid_lft forever preferred_lft forever
+8: lan3@veth2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master br-lan state UP qlen 1000
+    link/ether ce:98:28:38:1f:32 brd ff:ff:ff:ff:ff:ff
+    inet6 fe80::cc98:28ff:fe38:1f32/64 scope link 
+       valid_lft forever preferred_lft forever
+9: veth3@wan: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP qlen 1000
+    link/ether 52:6a:58:c6:85:b2 brd ff:ff:ff:ff:ff:ff
+    inet6 fe80::506a:58ff:fec6:85b2/64 scope link 
+       valid_lft forever preferred_lft forever
+10: wan@veth3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc cake state UP qlen 1000
+    link/ether c2:3a:1c:fe:73:78 brd ff:ff:ff:ff:ff:ff
+    inet 203.0.113.2/24 brd 203.0.113.255 scope global wan
+       valid_lft forever preferred_lft forever
+    inet6 fe80::c03a:1cff:fefe:7378/64 scope link 
+       valid_lft forever preferred_lft forever
+11: br-lan: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP qlen 1000
+    link/ether 42:5a:21:4e:9e:f5 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.1.1/24 brd 192.168.1.255 scope global br-lan
+       valid_lft forever preferred_lft forever
+    inet6 fd12:3456:789a::1/60 scope global noprefixroute 
+       valid_lft forever preferred_lft forever
+    inet6 fe80::80ea:1fff:fe16:33cf/64 scope link 
+       valid_lft forever preferred_lft forever
+18: ifb4wan: <BROADCAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc cake state UNKNOWN qlen 32
+    link/ether 96:a5:dd:c3:cd:77 brd ff:ff:ff:ff:ff:ff
+    inet6 fe80::94a5:ddff:fec3:cd77/64 scope link 
+       valid_lft forever preferred_lft forever
+=== lan status ===
+{
+	"up": true,
+	"pending": false,
+	"available": true,
+	"autostart": true,
+	"dynamic": false,
+	"uptime": 54,
+	"l3_device": "br-lan",
+	"proto": "static",
+	"device": "br-lan",
+	"updated": [
+		"addresses",
+		"routes"
+	],
+	"metric": 0,
+	"dns_metric": 0,
+	"delegation": true,
+	"ipv4-address": [
+		{
+			"address": "192.168.1.1",
+			"mask": 24
+		}
+	],
+	"ipv6-address": [
+		
+	],
+	"ipv6-prefix": [
+		
+	],
+	"ipv6-prefix-assignment": [
+		{
+			"address": "fd12:3456:789a::",
+			"mask": 60,
+			"local-address": {
+				"address": "fd12:3456:789a::1",
+				"mask": 60
+			}
+		}
+	],
+	"route": [
+		{
+			"target": "10.10.0.0",
+			"mask": 24,
+			"nexthop": "192.168.1.254",
+			"source": "0.0.0.0/0"
+		}
+	],
+	"dns-server": [
+		
+	],
+	"dns-search": [
+		
+	],
+	"neighbors": [
+		
+	],
+	"inactive": {
+		"ipv4-address": [
+			
+		],
+		"ipv6-address": [
+			
+		],
+		"route": [
+			
+		],
+		"dns-server": [
+			
+		],
+		"dns-search": [
+			
+		],
+		"neighbors": [
+			
+		]
+	},
+	"data": {
+		
+	}
+}
+=== luci.themes ===
+luci.themes=internal
+luci.themes.Bootstrap='/luci-static/bootstrap'
+luci.themes.BootstrapDark='/luci-static/bootstrap-dark'
+luci.themes.BootstrapLight='/luci-static/bootstrap-light'
+luci.themes.Pixel='/luci-static/pixel'
+=== themes.json ===
+[{"name":"Pixel","path":"/luci-static/pixel","dir":"pixel"}]
+=== http ===
+HTTP/1.1 403 Forbidden
+Connection: Keep-Alive
+Transfer-Encoding: chunked
+Keep-Alive: timeout=20
+x-luci-login-required: yes
+content-type: text/html; charset=UTF-8
+cache-control: no-cache
+expires: 0
+x-frame-options: SAMEORIGIN
+x-xss-protection: 1; mode=block
+x-content-type-options: nosniff
+
+<!DOCTYPE html>
+<html lang="en" data-theme="dark" data-darkmode="true">
+	<head>
+		<meta charset="utf-8">
+		<title>Overview · CR6608</title>
+		<script>
+			(function() {
+				var root = document.documentElement, pref = 'auto', mq = window.matchMedia('(prefers-color-scheme: dark)');
+				try { pref = localStorage.getItem('pixel.theme') || 'auto'; } catch (e) {}
+				function apply() {
+					var dark = pref === 'auto' ? mq.matches : pref === 'dark';
+					root.setAttribute('data-theme', dark ? 'dark' : 'light');
+					root.setAttribute('data-darkmode', dark ? 'true' : 'false');
+				}
+				window.pixelTheme = function(p) {
+					if (p) { pref = p; try { localStorage.setItem('pixel.theme', p); } catch (e) {} apply(); }
+					return pref;
+				};
+=== logread ===
+Sun Nov  1 05:04:08 2026 user.notice : Added device handler type: 8021q
+Sun Nov  1 05:04:08 2026 user.notice : Added device handler type: macvlan
+Sun Nov  1 05:04:08 2026 user.notice : Added device handler type: veth
+Sun Nov  1 05:04:08 2026 user.notice : Added device handler type: bridge
+Sun Nov  1 05:04:08 2026 user.notice : Added device handler type: Network device
+Sun Nov  1 05:04:08 2026 user.notice : Added device handler type: tunnel
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'lan' is enabled
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'lan' is setting up now
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'lan' is now up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: bridge 'br-lan' link is up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'lan' has link connectivity
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'loopback' is enabled
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'loopback' is setting up now
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'loopback' is now up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'wan' is enabled
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'wan' is setting up now
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'wan' is now up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: bridge 'br-lan' link is down
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'lan' has link connectivity loss
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Network device 'lan1' link is up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Network device 'veth0' link is up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: bridge 'br-lan' link is up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'lan' has link connectivity
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Network device 'lan2' link is up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Network device 'veth1' link is up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Network device 'lan3' link is up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Network device 'veth2' link is up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Network device 'lo' link is up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'loopback' has link connectivity
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Network device 'wan' link is up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'wan' has link connectivity
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Network device 'veth3' link is up
+Sun Nov  1 05:04:08 2026 user.notice SQM: Starting SQM script: piece_of_cake.qos on wan, in: 95000 Kbps, out: 20000 Kbps
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:08 2026 user.notice SQM: piece_of_cake.qos was started on wan successfully
+Sun Nov  1 05:04:08 2026 user.notice ddns-scripts[814]: demo: PID '814' started at 2026-11-01 05:04
+Sun Nov  1 05:04:08 2026 user.notice ddns-scripts[813]: myddns_ipv4: PID '813' started at 2026-11-01 05:04
+Sun Nov  1 05:04:08 2026 kern.info kernel: br-lan: port 1(lan1) entered forwarding state
+Sun Nov  1 05:04:08 2026 kern.warn kernel: nf_conntrack: table full, dropping packet
+Sun Nov  1 05:04:08 2026 kern.err kernel: mt7915e: failed to set txpower, retrying
+Sun Nov  1 05:04:08 2026 daemon.info netifd: Interface 'lan' is now up
+Sun Nov  1 05:04:08 2026 daemon.notice netifd: Interface 'wan' is now up
+Sun Nov  1 05:04:08 2026 user.warn ddns-scripts[813]: myddns_ipv4: Service section disabled! - TERMINATE
+Sun Nov  1 05:04:08 2026 daemon.warn netifd: Interface 'wan6' has link-local address only
+Sun Nov  1 05:04:08 2026 daemon.info dnsmasq-dhcp: DHCPDISCOVER(br-lan) aa:bb:cc:11:22:01
+Sun Nov  1 05:04:08 2026 daemon.info dnsmasq-dhcp: DHCPACK(br-lan) 192.168.1.101 aa:bb:cc:11:22:01 pixel-8-pro
+Sun Nov  1 05:04:08 2026 daemon.warn dnsmasq: Ignoring query from non-local network 203.0.113.50
+Sun Nov  1 05:04:08 2026 daemon.err dnsmasq: failed to send packet: Network is unreachable
+Sun Nov  1 05:04:08 2026 daemon.info odhcpd: Using a RA lifetime of 1800 seconds on br-lan
+Sun Nov  1 05:04:08 2026 authpriv.info dropbear: Child connection from 192.168.1.101:51234
+Sun Nov  1 05:04:08 2026 authpriv.notice dropbear: Password auth succeeded for root from 192.168.1.101:51234
+Sun Nov  1 05:04:08 2026 authpriv.warn dropbear: Bad password attempt for root from 203.0.113.77:40022
+Sun Nov  1 05:04:08 2026 daemon.crit hostapd: radio1: interface state COUNTRY_UPDATE->DFS
+Sun Nov  1 05:04:08 2026 daemon.info hostapd: phy1-ap0: STA aa:bb:cc:11:22:01 IEEE 802.11: associated
+Sun Nov  1 05:04:08 2026 user.notice firewall: Reloading firewall due to ifup of wan
+Sun Nov  1 05:04:08 2026 cron.info cron: heartbeat
+Sun Nov  1 05:04:08 2026 daemon.debug sqm: piece_of_cake.qos was started on wan successfully
+Sun Nov  1 05:04:08 2026 user.warn ddns-scripts[813]: myddns_ipv4: PID '813' exit WITH ERROR '1' at 2026-11-01 05:04
+Sun Nov  1 05:04:09 2026 user.notice SQM: Stopping SQM on wan
+Sun Nov  1 05:04:09 2026 user.notice SQM: Starting SQM script: piece_of_cake.qos on wan, in: 95000 Kbps, out: 20000 Kbps
+Sun Nov  1 05:04:09 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:09 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:09 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:09 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:09 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:09 2026 daemon.err modprobe: no module folders for kernel version 7.0.0-1017-azure found
+Sun Nov  1 05:04:09 2026 user.notice SQM: piece_of_cake.qos was started on wan successfully
+Sun Nov  1 05:04:19 2026 user.err ddns-scripts[814]: demo: BusyBox nslookup error: '1'
+Sun Nov  1 05:04:29 2026 user.err ddns-scripts[814]: demo: BusyBox nslookup error: '1'
+Sun Nov  1 05:04:29 2026 user.warn ddns-scripts[814]: demo: Get registered/public IP for 'demo.duckdns.org' failed - retry 1/0 in 60 seconds
+=== docker logs ===
+ -i INTERFACE        => ip_interface=INTERFACE; ip_source="interface"
+ -l FQDN             => lookup_host=FQDN
+ -n NETWORK          => ip_network=NETWORK; ip_source="network"
+ -p PROXY            => proxy=[USER:PASS@]PROXY:PORT
+ -s SCRIPT           => ip_script=SCRIPT; ip_source="script"
+ -t                  => force_dnstcp=1      (default 0)
+ -u URL              => ip_url=URL; ip_source="web"
+ -S SECTION          SECTION to start
+
+ -h                  => show this help and exit
+ -L                  => use_logfile=1    (default 0)
+ -v LEVEL            => VERBOSE=LEVEL    (default 0)
+ -V                  => show version and exit
+
+dynamic_dns_lucihelper.sh: invalid option --
+
+Usage:
+ dynamic_dns_lucihelper.sh [options] -- command
+
+Commands:
+ get_local_ip        using given INTERFACE or NETWORK or SCRIPT or URL
+ get_registered_ip   for given FQDN
+ verify_dns          given DNS-SERVER
+ verify_proxy        given PROXY
+ start               start given SECTION
+ reload              force running ddns processes to reload changed configuration
+ restart             restart all ddns processes
+
+Parameters:
+ -6                  => use_ipv6=1          (default 0)
+ -d DNS-SERVER       => dns_server=SERVER[:PORT]
+ -f                  => force_ipversion=1   (default 0)
+ -g                  => is_glue=1           (default 0)
+ -i INTERFACE        => ip_interface=INTERFACE; ip_source="interface"
+ -l FQDN             => lookup_host=FQDN
+ -n NETWORK          => ip_network=NETWORK; ip_source="network"
+ -p PROXY            => proxy=[USER:PASS@]PROXY:PORT
+ -s SCRIPT           => ip_script=SCRIPT; ip_source="script"
+ -t                  => force_dnstcp=1      (default 0)
+ -u URL              => ip_url=URL; ip_source="web"
+ -S SECTION          SECTION to start
+
+ -h                  => show this help and exit
+ -L                  => use_logfile=1    (default 0)
+ -v LEVEL            => VERBOSE=LEVEL    (default 0)
+ -V                  => show version and exit
+
+dynamic_dns_lucihelper.sh: invalid option --
+
+Usage:
+ dynamic_dns_lucihelper.sh [options] -- command
+
+Commands:
+ get_local_ip        using given INTERFACE or NETWORK or SCRIPT or URL
+ get_registered_ip   for given FQDN
+ verify_dns          given DNS-SERVER
+ verify_proxy        given PROXY
+ start               start given SECTION
+ reload              force running ddns processes to reload changed configuration
+ restart             restart all ddns processes
+
+Parameters:
+ -6                  => use_ipv6=1          (default 0)
+ -d DNS-SERVER       => dns_server=SERVER[:PORT]
+ -f                  => force_ipversion=1   (default 0)
+ -g                  => is_glue=1           (default 0)
+ -i INTERFACE        => ip_interface=INTERFACE; ip_source="interface"
+ -l FQDN             => lookup_host=FQDN
+ -n NETWORK          => ip_network=NETWORK; ip_source="network"
+ -p PROXY            => proxy=[USER:PASS@]PROXY:PORT
+ -s SCRIPT           => ip_script=SCRIPT; ip_source="script"
+ -t                  => force_dnstcp=1      (default 0)
+ -u URL              => ip_url=URL; ip_source="web"
+ -S SECTION          SECTION to start
+
+ -h                  => show this help and exit
+ -L                  => use_logfile=1    (default 0)
+ -v LEVEL            => VERBOSE=LEVEL    (default 0)
+ -V                  => show version and exit
+
