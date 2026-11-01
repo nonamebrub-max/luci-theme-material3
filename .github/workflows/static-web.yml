@@ -229,14 +229,35 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true' || steps.base_load.outcome == 'failure'
         continue-on-error: true
         run: |
-          set -e
-          docker run -d --name base "$OWRT_IMAGE" sleep infinity
-          docker exec base mkdir -p /var/lock /var/run
-          docker exec base sed -i 's#https://#http://#g' /etc/opkg/distfeeds.conf
-          docker exec base opkg update
-          docker exec base opkg install luci
+          set +e
+          mkdir -p dist
+          exec > >(tee dist/base_build.log) 2>&1
+
+          docker rm -f base 2>/dev/null
+          docker run -d --name base "$OWRT_IMAGE" sleep infinity || exit 1
+          docker exec base mkdir -p /var/lock /var/run /usr/libexec/rpcd /usr/share/rpcd/acl.d /etc/crontabs
+
+          # Bỏ feed kmods (đường dẫn gắn theo kernel, hay biến mất) và dùng http
+          docker exec base sed -i -e 's#https://#http://#g' -e '/kmods/d' /etc/opkg/distfeeds.conf
+          docker exec base cat /etc/opkg/distfeeds.conf
+
+          updated=0
+          for i in 1 2 3; do
+            if docker exec base opkg update; then updated=1; break; fi
+            echo "opkg update lần $i lỗi, thử lại sau 5s"
+            sleep 5
+          done
+          [ "$updated" = 1 ] || echo "::warning::opkg update báo lỗi ở một số feed, vẫn thử cài tiếp"
+
+          if ! docker exec base opkg install luci; then
+            echo "::error::Không cài được luci"
+            docker exec base opkg list 2>&1 | head -n 20
+            exit 1
+          fi
           for p in $EXTRA_PKGS; do
-            docker exec base opkg install "$p" || echo "::warning::Không cài được $p"
+            docker exec base opkg install "$p" \
+              || docker exec base opkg install --force-depends "$p" \
+              || echo "::warning::Không cài được $p"
           done
 
           # --- ACL: cấp đủ quyền đọc ubus/uci để không dính Access denied ---
