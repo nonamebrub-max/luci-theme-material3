@@ -3,7 +3,15 @@ name: Deploy theme preview (real LuCI)
 on:
   push:
     branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
   workflow_dispatch:
+    inputs:
+      fail_on_error:
+        description: 'Job đỏ nếu có lỗi (vẫn deploy trước khi báo đỏ)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,8 +24,11 @@ concurrency:
 
 env:
   OWRT_IMAGE: openwrt/rootfs:x86-64-openwrt-24.10
-  EXTRA_PKGS: luci-app-upnp luci-app-ddns luci-app-wol
-  FAIL_ON_ERROR: 'false'
+  EXTRA_PKGS: luci-app-sqm luci-app-upnp luci-app-ddns luci-app-wol
+  SITE_TITLE: luci-theme-material3
+  CHECK_CONTRAST: 'true'
+  CACHE_VERSION: v1
+  FAIL_ON_ERROR: ${{ inputs.fail_on_error && 'true' || 'false' }}
 
 jobs:
   preview:
@@ -33,16 +44,21 @@ jobs:
         with:
           node-version: 20
 
-      # ---------- Hàm ghi kết quả kiểm tra ----------
+      # ------------------------------------------------------------------
+      # Hàm hỗ trợ ghi kết quả kiểm tra
+      # ------------------------------------------------------------------
       - name: Init check helpers
         run: |
           mkdir -p checks dist
+          : > checks/oks
           : > checks/errors
           : > checks/warns
           cat > checks/lib.sh <<'END_LIB'
-          ok()   { echo "ok: $1";        echo "- ✅ $1" >> "$GITHUB_STEP_SUMMARY"; }
-          warn() { echo "::warning::$1"; echo "- ⚠️ $1" >> "$GITHUB_STEP_SUMMARY"; echo x >> checks/warns; }
-          fail() { echo "::error::$1";   echo "- ❌ $1" >> "$GITHUB_STEP_SUMMARY"; echo x >> checks/errors; }
+          ok()      { echo "ok: $1"; echo x >> checks/oks; }
+          info()    { echo "$1"; echo "- ℹ️ $1" >> "$GITHUB_STEP_SUMMARY"; }
+          warn()    { echo "::warning::$1"; echo "- ⚠️ $1" >> "$GITHUB_STEP_SUMMARY"; echo x >> checks/warns; }
+          fail()    { echo "::error::$1"; echo "- ❌ $1" >> "$GITHUB_STEP_SUMMARY"; echo x >> checks/errors; }
+          section() { printf '\n## %s\n\n' "$1" >> "$GITHUB_STEP_SUMMARY"; }
           END_LIB
 
       - name: Install dependencies
@@ -53,13 +69,25 @@ jobs:
           mkdir -p build/luci-static/material3
           npx sass styles/cascade.scss build/luci-static/material3/cascade.css --no-source-map
 
-      # ---------- Kiểm tra tĩnh ----------
+      - name: Install capture tools
+        run: |
+          mkdir -p tools
+          cd tools
+          npm init -y >/dev/null
+          npm install playwright sharp axe-core
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            npx playwright install --with-deps chromium
+          fi
+
+      # ------------------------------------------------------------------
+      # Kiểm tra tĩnh (chưa cần router)
+      # ------------------------------------------------------------------
       - name: Static checks
         continue-on-error: true
         run: |
           set +e
           source checks/lib.sh
-          echo "## Kiểm tra tĩnh" >> "$GITHUB_STEP_SUMMARY"
+          section "Kiểm tra tĩnh"
 
           for f in \
             ucode/template/themes/material3/header.ut \
@@ -80,14 +108,26 @@ jobs:
 
           sz=$(stat -c%s build/luci-static/material3/cascade.css)
           if [ "$sz" -gt 20000 ]; then ok "cascade.css biên dịch được ($sz byte)"; else fail "cascade.css quá nhỏ ($sz byte)"; fi
+          info "cascade.css: $sz byte, gzip $(gzip -9 -c build/luci-static/material3/cascade.css | wc -c) byte"
+
+          if grep -q '@import' build/luci-static/material3/cascade.css; then warn "cascade.css còn @import chưa được inline"; else ok "cascade.css không còn @import"; fi
+
+          pcs=$(grep -c 'prefers-color-scheme' build/luci-static/material3/cascade.css)
+          dm=$(grep -c 'darkmode' build/luci-static/material3/cascade.css)
+          if [ "$pcs" -gt 0 ]; then ok "CSS có $pcs khối prefers-color-scheme"; fi
+          if [ "$dm" -gt 0 ]; then ok "CSS có $dm selector darkmode"; fi
+          if [ "$pcs" -eq 0 ] && [ "$dm" -eq 0 ]; then warn "CSS không có cơ chế dark mode (prefers-color-scheme hoặc darkmode)"; fi
+
+          if sh -n root/etc/uci-defaults/30_luci-theme-material3 2>/dev/null; then ok "uci-defaults đúng cú pháp shell"; else fail "uci-defaults lỗi cú pháp shell"; fi
+          if grep -q 'luci.mk' Makefile; then ok "Makefile include luci.mk"; else warn "Makefile không thấy luci.mk"; fi
 
           for f in ucode/template/themes/material3/*.ut; do
             o1=$(grep -o '{%' "$f" | wc -l); c1=$(grep -o '%}' "$f" | wc -l)
             o2=$(grep -o '{{' "$f" | wc -l); c2=$(grep -o '}}' "$f" | wc -l)
             if [ "$o1" -eq "$c1" ] && [ "$o2" -eq "$c2" ]; then
-              ok "Template $(basename "$f"): cặp {% %} ($o1) và {{ }} ($o2) cân bằng"
+              ok "Template $(basename "$f") cân bằng cặp ucode"
             else
-              warn "Template $(basename "$f"): lệch cặp {% %} ($o1/$c1) hoặc {{ }} ($o2/$c2)"
+              warn "Template $(basename "$f") lệch cặp {% %} ($o1/$c1) hoặc {{ }} ($o2/$c2)"
             fi
           done
 
@@ -161,28 +201,45 @@ jobs:
             esac
           done
 
-      # ---------- Chuẩn bị image OpenWrt & Giả lập thông tin Router ----------
-      - name: Prepare OpenWrt image
-        id: prep
+      # ------------------------------------------------------------------
+      # Image OpenWrt nền (cache theo tuần)
+      # ------------------------------------------------------------------
+      - name: Compute cache key
+        id: ck
+        run: |
+          raw="$CACHE_VERSION|$OWRT_IMAGE|$(date +%G-%V)|$EXTRA_PKGS|${{ hashFiles('.github/workflows/static-web.yml') }}"
+          key=$(echo "$raw" | md5sum | cut -c1-32)
+          echo "key=owrt-base-$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore base image cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/owrt-base.tar.gz
+          key: ${{ steps.ck.outputs.key }}
+
+      - name: Load cached base image
+        id: base_load
+        if: steps.cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        run: docker load -i /tmp/owrt-base.tar.gz
+
+      - name: Build OpenWrt base image
+        id: base_build
+        if: steps.cache.outputs.cache-hit != 'true' || steps.base_load.outcome == 'failure'
         continue-on-error: true
         run: |
-          docker run -d --name prep "$OWRT_IMAGE" sleep infinity
-          docker exec prep mkdir -p /var/lock /var/run /var/etc /tmp/hosts /usr/share/rpcd/acl.d /etc/config
-          docker exec prep sed -i 's#https://#http://#g' /etc/opkg/distfeeds.conf
-          docker exec prep opkg update
-          docker exec prep opkg install luci
+          set -e
+          docker run -d --name base "$OWRT_IMAGE" sleep infinity
+          docker exec base mkdir -p /var/lock /var/run
+          docker exec base sed -i 's#https://#http://#g' /etc/opkg/distfeeds.conf
+          docker exec base opkg update
+          docker exec base opkg install luci
           for p in $EXTRA_PKGS; do
-            docker exec prep opkg install "$p" || echo "::warning::Không cài được $p"
+            docker exec base opkg install "$p" || echo "::warning::Không cài được $p"
           done
 
-          # Cài file theme
-          docker cp htdocs/. prep:/www/
-          docker cp build/luci-static/material3/cascade.css prep:/www/luci-static/material3/cascade.css
-          docker exec prep mkdir -p /usr/share/ucode/luci/template/themes
-          docker cp ucode/template/themes/material3 prep:/usr/share/ucode/luci/template/themes/
-          docker cp root/. prep:/ || true
-
-          # 1. FIX ACCESS DENIED: Cấp full quyền đọc uci/ubus cho cả unauthenticated và root
+          # --- ACL: cấp đủ quyền đọc ubus/uci để không dính Access denied ---
           cat > full-acl.json <<'END_ACL'
           {
             "unauthenticated": {
@@ -203,77 +260,47 @@ jobs:
             }
           }
           END_ACL
-          docker cp full-acl.json prep:/usr/share/rpcd/acl.d/theme-material3-full.json
+          docker cp full-acl.json base:/usr/share/rpcd/acl.d/theme-preview-full.json
 
-          # 2. Set mật khẩu root chuẩn qua MD5 crypt
-          HASH=$(openssl passwd -1 -salt OpenWrt root)
-          docker exec prep sed -i "s|^root:[^:]*:|root:$HASH:|g" /etc/shadow
+          # --- Giả lập object ubus "system" (thường do procd cung cấp) ---
+          cat > system_plugin <<'END_SYSPLUGIN'
+          #!/bin/sh
+          case "$1" in
+          list)
+            echo '{"info":{},"board":{}}'
+            ;;
+          call)
+            case "$2" in
+            info)
+              now=$(date +%s)
+              cat <<JSON
+          {"uptime":$((273600 + now % 3600)),"localtime":$((now + 25200)),
+           "load":[6554,9830,7864],
+           "memory":{"total":536870912,"free":310378496,"shared":1048576,"buffered":12582912,"available":355000000,"cached":60000000},
+           "swap":{"total":0,"free":0},
+           "root":{"total":122880,"free":98304,"used":24576,"avail":98304},
+           "tmp":{"total":262144,"free":258000,"used":4144,"avail":258000}}
+          JSON
+              ;;
+            board)
+              cat <<JSON
+          {"kernel":"6.6.119","hostname":"Material3-Router","system":"MediaTek MT7986A",
+           "model":"Material3 Wi-Fi 6 Router Pro","board_name":"material3,router-pro",
+           "rootfs_type":"squashfs",
+           "release":{"distribution":"OpenWrt","version":"24.10.0","revision":"r27000-material3",
+                      "codename":"","target":"mediatek/filogic",
+                      "description":"OpenWrt 24.10.0 r27000 (Material 3 Edition)","builddate":"1760000000"}}
+          JSON
+              ;;
+            *) echo '{}' ;;
+            esac
+            ;;
+          esac
+          END_SYSPLUGIN
+          docker cp system_plugin base:/usr/libexec/rpcd/system
+          docker exec base chmod +x /usr/libexec/rpcd/system
 
-          # 3. GIẢ LẬP BOARD VÀ THÔNG TIN PHẦN CỨNG ROUTER
-          cat > board.json <<'END_BOARD'
-          {
-            "model": {
-              "id": "material3,router-pro",
-              "name": "Material3 Wi-Fi 6 Router Pro"
-            },
-            "system": {
-              "compat_version": "1.0"
-            },
-            "network": {
-              "lan": { "device": "br-lan", "protocol": "static" },
-              "wan": { "device": "br-wan", "protocol": "dhcp" }
-            }
-          }
-          END_BOARD
-          docker cp board.json prep:/etc/board.json
-
-          cat > release <<'END_REL'
-          DISTRIB_ID='OpenWrt'
-          DISTRIB_RELEASE='24.10.0'
-          DISTRIB_REVISION='r27000-material3'
-          DISTRIB_TARGET='x86/64'
-          DISTRIB_ARCH='x86_64'
-          DISTRIB_DESCRIPTION='OpenWrt 24.10.0 r27000 (Material 3 Edition)'
-          DISTRIB_TAINTS=''
-          END_REL
-          docker cp release prep:/etc/openwrt_release
-
-          # 4. GIẢ LẬP CÁC FILE CẤU HÌNH TRÁNH LỖI "Resource not found" (ubus code 4)
-          cat > wireless.conf <<'END_WIFI'
-          config wifi-device 'radio0'
-              option type 'mac80211'
-              option path 'pci0000:00/0000:00:01.0'
-              option channel '36'
-              option band '5g'
-              option htmode 'HE80'
-              option disabled '0'
-
-          config wifi-iface 'default_radio0'
-              option device 'radio0'
-              option network 'lan'
-              option mode 'ap'
-              option ssid 'Material3-Router-5G'
-              option encryption 'psk2'
-              option key 'OpenWrt@2026'
-
-          config wifi-device 'radio1'
-              option type 'mac80211'
-              option path 'pci0000:00/0000:00:02.0'
-              option channel '6'
-              option band '2g'
-              option htmode 'HE20'
-              option disabled '0'
-
-          config wifi-iface 'default_radio1'
-              option device 'radio1'
-              option network 'lan'
-              option mode 'ap'
-              option ssid 'Material3-Router-2.4G'
-              option encryption 'psk2'
-              option key 'OpenWrt@2026'
-          END_WIFI
-          docker cp wireless.conf prep:/etc/config/wireless
-
+          # --- Cấu hình mạng giả lập: 2 bridge rỗng, không đụng eth0 của Docker ---
           cat > network.conf <<'END_NET'
           config interface 'loopback'
               option device 'lo'
@@ -289,17 +316,17 @@ jobs:
               option type 'bridge'
               option bridge_empty '1'
 
+          config device
+              option name 'br-wan'
+              option type 'bridge'
+              option bridge_empty '1'
+
           config interface 'lan'
               option device 'br-lan'
               option proto 'static'
               option ipaddr '192.168.1.1'
               option netmask '255.255.255.0'
               option ip6assign '60'
-
-          config device
-              option name 'br-wan'
-              option type 'bridge'
-              option bridge_empty '1'
 
           config interface 'wan'
               option device 'br-wan'
@@ -309,8 +336,48 @@ jobs:
               option gateway '203.0.113.1'
               list dns '1.1.1.1'
               list dns '8.8.8.8'
+
+          config route
+              option interface 'lan'
+              option target '10.10.0.0/24'
+              option gateway '192.168.1.254'
           END_NET
-          docker cp network.conf prep:/etc/config/network
+          docker cp network.conf base:/etc/config/network
+
+          cat > wireless.conf <<'END_WIFI'
+          config wifi-device 'radio0'
+              option type 'mac80211'
+              option path 'pci0000:00/0000:00:01.0'
+              option channel '36'
+              option band '5g'
+              option htmode 'HE80'
+              option country 'VN'
+
+          config wifi-iface 'default_radio0'
+              option device 'radio0'
+              option network 'lan'
+              option mode 'ap'
+              option ssid 'Material3-5G'
+              option encryption 'psk2'
+              option key 'OpenWrt@2026'
+
+          config wifi-device 'radio1'
+              option type 'mac80211'
+              option path 'pci0000:00/0000:00:02.0'
+              option channel '6'
+              option band '2g'
+              option htmode 'HE20'
+              option country 'VN'
+
+          config wifi-iface 'default_radio1'
+              option device 'radio1'
+              option network 'lan'
+              option mode 'ap'
+              option ssid 'Material3-2.4G'
+              option encryption 'psk2'
+              option key 'OpenWrt@2026'
+          END_WIFI
+          docker cp wireless.conf base:/etc/config/wireless
 
           cat > firewall.conf <<'END_FW'
           config defaults
@@ -338,13 +405,62 @@ jobs:
           config forwarding
               option src 'lan'
               option dest 'wan'
-          END_FW
-          docker cp firewall.conf prep:/etc/config/firewall
 
-          cat > setup.sh <<'END_SETUP'
-          uci set luci.themes.Material3=/luci-static/material3
-          uci set luci.main.mediaurlbase=/luci-static/material3
-          uci commit luci
+          config redirect
+              option name 'NAS-HTTPS'
+              option src 'wan'
+              option dest 'lan'
+              option proto 'tcp'
+              option src_dport '8443'
+              option dest_ip '192.168.1.20'
+              option dest_port '443'
+              option target 'DNAT'
+
+          config rule
+              option name 'Allow-Ping'
+              option src 'wan'
+              option proto 'icmp'
+              option icmp_type 'echo-request'
+              option family 'ipv4'
+              option target 'ACCEPT'
+
+          config rule
+              option name 'Allow-SSH-WAN'
+              option src 'wan'
+              option proto 'tcp'
+              option dest_port '22'
+              option target 'ACCEPT'
+              option enabled '0'
+          END_FW
+          docker cp firewall.conf base:/etc/config/firewall
+
+          cat > system.conf <<'END_SYS'
+          config system
+              option hostname 'Material3-Router'
+              option timezone '<+07>-7'
+              option zonename 'Asia/Ho Chi Minh'
+              option log_size '64'
+              option ttylogin '0'
+              option urandom_seed '0'
+
+          config timeserver 'ntp'
+              option enabled '1'
+              option enable_server '0'
+              list server '0.openwrt.pool.ntp.org'
+              list server '1.openwrt.pool.ntp.org'
+          END_SYS
+          docker cp system.conf base:/etc/config/system
+
+          cat > cron.txt <<'END_CRON'
+          0 4 * * * /sbin/reboot
+          */30 * * * * /usr/bin/logger -t cron "heartbeat"
+          END_CRON
+          docker exec base mkdir -p /etc/crontabs
+          docker cp cron.txt base:/etc/crontabs/root
+
+          # --- Dữ liệu cấu hình bằng uci ---
+          cat > setup_base.sh <<'END_SETUP'
+          printf "root\nroot\n" | passwd root
 
           uci add dhcp host
           uci set dhcp.@host[-1].name="nas-storage"
@@ -354,39 +470,135 @@ jobs:
           uci set dhcp.@host[-1].name="color-printer"
           uci set dhcp.@host[-1].mac="aa:bb:cc:11:22:11"
           uci set dhcp.@host[-1].ip="192.168.1.30"
+          uci add dhcp domain
+          uci set dhcp.@domain[-1].name="router.lan"
+          uci set dhcp.@domain[-1].ip="192.168.1.1"
           uci commit dhcp
-          rm -rf /tmp/luci-*
-          END_SETUP
-          docker cp setup.sh prep:/tmp/setup.sh
-          docker exec prep sh -x /tmp/setup.sh || true
 
-          # 5. Script chạy daemon: uhttpd BẮT BUỘC có tham số -u /ubus
+          uci -q get sqm.eth1 >/dev/null || uci set sqm.eth1=queue
+          uci set sqm.eth1.enabled=1
+          uci set sqm.eth1.interface=br-wan
+          uci set sqm.eth1.download=95000
+          uci set sqm.eth1.upload=20000
+          uci set sqm.eth1.qdisc=cake
+          uci set sqm.eth1.script=piece_of_cake.qos
+          uci set sqm.eth1.linklayer=ethernet
+          uci set sqm.eth1.overhead=18
+          uci commit sqm
+
+          uci set upnpd.config.enabled=1
+          uci set upnpd.config.external_iface=wan
+          uci set upnpd.config.internal_iface=lan
+          uci commit upnpd
+
+          uci set ddns.demo=service
+          uci set ddns.demo.enabled=1
+          uci set ddns.demo.service_name=duckdns.org
+          uci set ddns.demo.lookup_host=demo.duckdns.org
+          uci set ddns.demo.domain=demo.duckdns.org
+          uci set ddns.demo.username=demo
+          uci set ddns.demo.password=secret
+          uci set ddns.demo.ip_source=network
+          uci set ddns.demo.ip_network=wan
+          uci set ddns.demo.interface=wan
+          uci set ddns.demo.use_syslog=2
+          uci commit ddns
+
+          /etc/init.d/firewall disable
+          /etc/init.d/rpcd enable
+          /etc/init.d/uhttpd enable
+          rm -rf /tmp/luci-*
+          exit 0
+          END_SETUP
+          docker cp setup_base.sh base:/tmp/setup_base.sh
+          docker exec base sh /tmp/setup_base.sh || true
+
+          # --- Script chạy daemon (không dùng procd để eth0 của Docker sống) ---
           cat > run_services.sh <<'END_RUN'
           #!/bin/sh
-          mkdir -p /var/run /var/lock /tmp/hosts /tmp/run
-          /sbin/ubusd &
-          sleep 1
+          mkdir -p /var/run/ubus /var/lock /tmp/hosts /tmp/run /var/state /tmp/resolv.conf.d
+          [ -e /tmp/resolv.conf.d/resolv.conf.auto ] || : > /tmp/resolv.conf.d/resolv.conf.auto
+
+          # Giữ eth0 của Docker luôn up và có IP (phòng netifd làm rớt)
+          CIDR=$(ip -4 -o addr show dev eth0 | awk '{print $4}' | head -n1)
+          (
+            while true; do
+              ip link set eth0 up 2>/dev/null
+              ip addr show dev eth0 2>/dev/null | grep -q "$CIDR" || ip addr replace "$CIDR" dev eth0 2>/dev/null
+              sleep 2
+            done
+          ) &
+
+          /sbin/ubusd -s /var/run/ubus/ubus.sock &
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            [ -S /var/run/ubus/ubus.sock ] && break
+            sleep 1
+          done
+
+          /sbin/logd -S 64 &
           /sbin/rpcd -s /var/run/ubus/ubus.sock -t 30 &
           sleep 1
-          # -u /ubus là cầu nối bắt buộc để uhttpd chuyển tiếp RPC sang rpcd
-          exec /usr/sbin/uhttpd -f -p 0.0.0.0:8080 -h /www -r Material3-Router -x /cgi-bin -u /ubus -U /var/run/ubus/ubus.sock
+          /sbin/netifd &
+          sleep 3
+          ubus call network reload 2>/dev/null
+
+          # -u /ubus là cầu nối bắt buộc để uhttpd chuyển RPC sang rpcd
+          exec /usr/sbin/uhttpd -f -p 0.0.0.0:8080 -h /www -r Material3-Router \
+            -x /cgi-bin -u /ubus -U /var/run/ubus/ubus.sock -t 60 -T 30 -n 30 -N 100
           END_RUN
-          docker cp run_services.sh prep:/run_services.sh
-          docker exec prep chmod +x /run_services.sh
+          docker cp run_services.sh base:/run_services.sh
+          docker exec base chmod +x /run_services.sh
 
-          docker commit prep owrt-prepared
-          docker rm -f prep
+          docker commit base owrt-base
+          docker rm -f base
+          docker save owrt-base | gzip -1 > /tmp/owrt-base.tar.gz
 
-      # ---------- Boot OpenWrt Services ----------
-      - name: Boot OpenWrt
+      # ------------------------------------------------------------------
+      # Chạy router giả
+      # ------------------------------------------------------------------
+      - name: Start OpenWrt services
         id: boot
-        if: steps.prep.outcome == 'success'
+        if: steps.base_build.outcome == 'success' || steps.base_load.outcome == 'success'
         continue-on-error: true
         run: |
-          docker run -d --name owrt -p 8080:8080 owrt-prepared /run_services.sh
+          docker run -d --name owrt --privileged -p 8080:8080 owrt-base /run_services.sh
+          for i in $(seq 1 40); do
+            if docker exec owrt ubus list 2>/dev/null | grep -qx 'network.interface.lan'; then
+              echo "netifd sẵn sàng sau ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          docker exec owrt ubus list || true
 
-          sleep 3
+      - name: Install theme into router
+        id: theme
+        if: steps.boot.outcome == 'success'
+        continue-on-error: true
+        run: |
+          docker cp htdocs/. owrt:/www/
+          docker cp build/luci-static/material3/cascade.css owrt:/www/luci-static/material3/cascade.css
+          docker exec owrt mkdir -p /usr/share/ucode/luci/template/themes
+          docker cp ucode/template/themes/. owrt:/usr/share/ucode/luci/template/themes/
+          docker cp root/. owrt:/ || true
+          docker exec owrt sh -c 'chmod +x /etc/uci-defaults/* 2>/dev/null; true'
 
+          # Chạy chính script uci-defaults của repo rồi ghi lại kết quả để kiểm tra
+          docker exec owrt sh /etc/uci-defaults/30_luci-theme-material3 || echo "::warning::uci-defaults của theme chạy lỗi"
+          docker exec owrt sh -c 'uci -q show luci.themes' > checks/themes_after.txt || true
+          cat checks/themes_after.txt
+
+          # Đảm bảo preview dùng đúng theme
+          docker exec owrt uci set luci.themes.Material3=/luci-static/material3
+          docker exec owrt uci set luci.main.mediaurlbase=/luci-static/material3
+          docker exec owrt uci commit luci
+          docker exec owrt sh -c 'rm -rf /tmp/luci-*'
+
+      - name: Seed demo data and wait for LuCI
+        id: ready
+        if: steps.theme.outcome == 'success'
+        continue-on-error: true
+        run: |
           now=$(date +%s)
           exp=$((now + 43200))
           cat > dhcp.leases <<EOF
@@ -397,43 +609,85 @@ jobs:
           EOF
           docker cp dhcp.leases owrt:/tmp/dhcp.leases
 
-          for i in $(seq 1 20); do
-            code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://127.0.0.1:8080/cgi-bin/luci/ || true)
-            echo "try $i: HTTP $code"
-            case "$code" in
-              200|302|403) echo "LuCI up thành công!"; exit 0 ;;
-            esac
-            sleep 1
+          cat > seed.sh <<'END_SEED'
+          #!/bin/sh
+          for e in "192.168.1.101 aa:bb:cc:11:22:01" "192.168.1.102 aa:bb:cc:11:22:02" "192.168.1.103 aa:bb:cc:11:22:03" "192.168.1.20 aa:bb:cc:11:22:10"; do
+            set -- $e
+            ip neigh replace "$1" lladdr "$2" dev br-lan nud permanent 2>/dev/null
           done
 
-          echo "=== chẩn đoán fail ==="
-          docker exec owrt ps
-          docker logs owrt
+          logger -p kern.info -t kernel "br-lan: port 1(lan1) entered forwarding state"
+          logger -p kern.warn -t kernel "nf_conntrack: table full, dropping packet"
+          logger -p kern.err -t kernel "ath11k: failed to set txpower, retrying"
+          logger -p daemon.info -t netifd "Interface 'lan' is now up"
+          logger -p daemon.notice -t netifd "Interface 'wan' is now up"
+          logger -p daemon.warn -t netifd "Interface 'wan6' has link-local address only"
+          logger -p daemon.info -t dnsmasq-dhcp "DHCPDISCOVER(br-lan) aa:bb:cc:11:22:01"
+          logger -p daemon.info -t dnsmasq-dhcp "DHCPACK(br-lan) 192.168.1.101 aa:bb:cc:11:22:01 pixel-8-pro"
+          logger -p daemon.warn -t dnsmasq "Ignoring query from non-local network 203.0.113.50"
+          logger -p daemon.err -t dnsmasq "failed to send packet: Network is unreachable"
+          logger -p daemon.info -t odhcpd "Using a RA lifetime of 1800 seconds on br-lan"
+          logger -p authpriv.info -t dropbear "Child connection from 192.168.1.101:51234"
+          logger -p authpriv.notice -t dropbear "Password auth succeeded for root from 192.168.1.101:51234"
+          logger -p authpriv.warn -t dropbear "Bad password attempt for root from 203.0.113.77:40022"
+          logger -p daemon.crit -t hostapd "radio0: interface state COUNTRY_UPDATE->DFS"
+          logger -p daemon.info -t hostapd "phy0-ap0: STA aa:bb:cc:11:22:01 IEEE 802.11: associated"
+          logger -p user.notice -t firewall "Reloading firewall due to ifup of wan"
+          logger -p cron.info -t cron "heartbeat"
+          logger -p daemon.debug -t sqm "piece_of_cake.qos was started on br-wan successfully"
+          exit 0
+          END_SEED
+          docker cp seed.sh owrt:/tmp/seed.sh
+          docker exec owrt sh /tmp/seed.sh || true
+
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8080/cgi-bin/luci/ || true)
+            echo "try $i: HTTP $code"
+            case "$code" in
+              200|302|403) echo "LuCI up"; exit 0 ;;
+            esac
+            sleep 2
+          done
+
+          echo "=== ps ===";        docker exec owrt ps || true
+          echo "=== docker logs ==="; docker logs owrt 2>&1 | tail -n 60 || true
           echo "::error::LuCI không lên"
           exit 1
 
-      # ---------- Runtime checks ----------
+      # ------------------------------------------------------------------
+      # Kiểm tra trên router
+      # ------------------------------------------------------------------
       - name: Runtime checks
-        if: steps.boot.outcome == 'success'
+        if: steps.ready.outcome == 'success'
         continue-on-error: true
         run: |
           set +e
           source checks/lib.sh
-          echo "## Kiểm tra trên OpenWrt" >> "$GITHUB_STEP_SUMMARY"
+          section "Kiểm tra trên OpenWrt"
           U=http://127.0.0.1:8080
           ex() { docker exec owrt "$@"; }
 
-          ok "$(ex sh -c '. /etc/openwrt_release; echo $DISTRIB_DESCRIPTION')"
+          info "$(ex sh -c '. /etc/openwrt_release; echo $DISTRIB_DESCRIPTION')"
 
-          for s in ubusd rpcd uhttpd; do
+          for s in ubusd rpcd uhttpd netifd logd; do
             if ex ps | grep -q "[/ ]$s"; then ok "Dịch vụ $s đang chạy"; else fail "Dịch vụ $s không chạy"; fi
           done
 
           objs=$(ex ubus list)
-          for o in session uci file; do
+          for o in session uci file system luci luci-rpc network.interface network.device; do
             if echo "$objs" | grep -qx "$o"; then ok "ubus có object $o"; else fail "ubus thiếu object $o"; fi
           done
 
+          if ex ubus call system info | grep -q '"uptime"'; then ok "ubus system info trả dữ liệu"; else fail "ubus system info không trả dữ liệu"; fi
+          if ex ubus call network.interface.lan status | grep -q '"up": true'; then ok "Interface lan đang up"; else warn "Interface lan không up"; fi
+          if ex ubus call network.interface.wan status | grep -q '"up": true'; then ok "Interface wan đang up"; else warn "Interface wan không up"; fi
+          if ex ubus call luci-rpc getDHCPLeases | grep -q pixel-8-pro; then ok "DHCP lease giả hiển thị qua luci-rpc"; else warn "Không thấy DHCP lease giả"; fi
+
+          lines=$(ex logread | wc -l)
+          if [ "$lines" -gt 5 ]; then ok "logread có $lines dòng"; else warn "logread chỉ có $lines dòng (trang System Log sẽ trống)"; fi
+
+          # Theme và uci-defaults của repo
+          if grep -qi material3 checks/themes_after.txt; then ok "uci-defaults của repo đăng ký theme material3"; else warn "uci-defaults của repo KHÔNG đăng ký theme (luci.themes không có material3)"; fi
           mb=$(ex uci -q get luci.main.mediaurlbase)
           if [ "$mb" = "/luci-static/material3" ]; then ok "Theme mặc định là material3"; else fail "mediaurlbase = '$mb'"; fi
           for t in header footer sysauth; do
@@ -444,6 +698,7 @@ jobs:
             if ex opkg list-installed | grep -q "^$p "; then ok "Đã cài $p"; else warn "Chưa cài được $p"; fi
           done
 
+          # Mọi file tĩnh phải được web server phục vụ
           cnt=0
           bad=0
           while IFS= read -r f; do
@@ -460,33 +715,54 @@ jobs:
             *) warn "cascade.css content-type lạ: $ct" ;;
           esac
 
+          # Trang đăng nhập render từ template thật
           html=$(curl -s -m 15 "$U/cgi-bin/luci/")
           if [ -n "$html" ]; then ok "Trang đăng nhập có nội dung"; else fail "Trang đăng nhập rỗng"; fi
-          if echo "$html" | grep -q 'material3'; then ok "HTML đăng nhập nhắc tới material3"; else fail "HTML đăng nhập không dùng theme material3"; fi
+          if echo "$html" | grep -q 'material3'; then ok "HTML đăng nhập dùng theme material3"; else fail "HTML đăng nhập không dùng theme material3"; fi
           if echo "$html" | grep -q 'cascade.css'; then ok "HTML đăng nhập nạp cascade.css"; else fail "HTML đăng nhập không nạp cascade.css"; fi
+          if echo "$html" | grep -Eq '\{%|\{\{'; then fail "HTML đăng nhập còn cú pháp ucode chưa render"; else ok "HTML đăng nhập không còn cú pháp ucode"; fi
+          if echo "$html" | grep -Eiq 'Failed to (load|compile)|Syntax error|Reference error|Unable to compile|Runtime error'; then fail "Trang đăng nhập báo lỗi template/ucode"; else ok "Trang đăng nhập không báo lỗi template"; fi
 
-      # ---------- Playwright Capture ----------
-      - name: Install Playwright and sharp
-        if: steps.boot.outcome == 'success'
-        continue-on-error: true
-        run: |
-          npm install --no-save playwright sharp
-          npx playwright install --with-deps chromium
+          # API ubus qua HTTP
+          resp=$(curl -s -m 10 "$U/ubus" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":"root"}]}')
+          tok=$(echo "$resp" | sed -n 's/.*"ubus_rpc_session":"\([^"]*\)".*/\1/p')
+          if [ -n "$tok" ]; then
+            ok "Đăng nhập ubus JSON-RPC thành công"
+            body=$(printf '{"jsonrpc":"2.0","id":1,"method":"call","params":["%s","system","info",{}]}' "$tok")
+            if curl -s -m 10 "$U/ubus" -H 'Content-Type: application/json' -d "$body" | grep -q '"uptime"'; then ok "system info qua HTTP ubus hoạt động"; else fail "system info qua HTTP ubus không hoạt động"; fi
+          else
+            fail "Đăng nhập ubus JSON-RPC thất bại: $resp"
+          fi
 
+          errs=$(ex logread | grep -Ei 'ucode|luci|uhttpd|rpcd' | grep -Ei 'error|fail|exception' | head -n 5)
+          if [ -n "$errs" ]; then warn "logread có lỗi liên quan LuCI: $(echo "$errs" | head -n 2 | tr '\n' ' ')"; else ok "logread không có lỗi liên quan LuCI"; fi
+
+      # ------------------------------------------------------------------
+      # Chụp và kiểm tra từng trang
+      # ------------------------------------------------------------------
       - name: Capture and check pages
-        if: steps.boot.outcome == 'success'
+        if: steps.ready.outcome == 'success'
         continue-on-error: true
         run: |
           mkdir -p dist/shots
-          cat > capture.mjs <<'END_CAPTURE'
+          cat > tools/capture.mjs <<'END_CAPTURE'
           import { chromium } from 'playwright';
           import sharp from 'sharp';
           import fs from 'node:fs';
+          import { createRequire } from 'node:module';
 
+          const require = createRequire(import.meta.url);
           const ORIGIN = 'http://127.0.0.1:8080';
           const BASE = ORIGIN + '/cgi-bin/luci';
+          const USER = 'root';
+          const PASS = 'root';
           const MAX_H = 12000;
+          const AXE = process.env.CHECK_CONTRAST === 'true' ? require.resolve('axe-core') : null;
 
+          const DEVICES = { desktop: { width: 1366, height: 850 }, mobile: { width: 390, height: 844 } };
+          const SCHEMES = ['light', 'dark'];
+
+          // [id, tiêu đề, nhóm, đường dẫn, thao tác tùy chọn (trả false để bỏ qua)]
           const PAGES = [
             ['overview',    'Overview',        'Status',   '/admin/status/overview'],
             ['routes',      'Routing',         'Status',   '/admin/status/routes'],
@@ -496,64 +772,106 @@ jobs:
             ['interfaces',  'Interfaces',      'Network',  '/admin/network/network'],
             ['iface-modal', 'Edit interface',  'Network',  '/admin/network/network',
               async (p) => {
-                const btn = p.locator('.cbi-button-edit, button:has-text("Edit"), .cbi-button-neutral').first();
-                if (await btn.count() > 0) {
-                  await btn.click({ timeout: 5000 }).catch(() => {});
-                  await p.waitForSelector('.modal', { timeout: 4000 }).catch(() => {});
-                  await p.waitForTimeout(600);
-                }
+                const btn = p.locator('.cbi-button-edit, button:has-text("Edit")').first();
+                if (!(await btn.count())) return false;
+                await btn.click({ timeout: 5000 });
+                await p.waitForSelector('.modal', { timeout: 5000 });
+                await p.waitForTimeout(700);
               }],
             ['wireless',    'Wireless',        'Network',  '/admin/network/wireless'],
             ['dhcp',        'DHCP and DNS',    'Network',  '/admin/network/dhcp'],
-            ['firewall',    'Firewall',        'Network',  '/admin/network/firewall'],
+            ['hosts',       'Hostnames',       'Network',  '/admin/network/hosts'],
+            ['static-routes','Static Routes',  'Network',  '/admin/network/routes'],
+            ['firewall',    'Firewall zones',  'Network',  '/admin/network/firewall'],
+            ['fw-forwards', 'Port forwards',   'Network',  '/admin/network/firewall/forwards'],
+            ['fw-rules',    'Traffic rules',   'Network',  '/admin/network/firewall/rules'],
+            ['sqm',         'SQM QoS',         'Network',  '/admin/network/sqm'],
             ['diagnostics', 'Diagnostics',     'Network',  '/admin/network/diagnostics'],
             ['system',      'System',          'System',   '/admin/system/system'],
+            ['dropdown',    'Dropdown opened', 'System',   '/admin/system/system',
+              async (p) => {
+                const dd = p.locator('.cbi-dropdown').first();
+                if (!(await dd.count())) return false;
+                await dd.click({ timeout: 5000 });
+                await p.waitForTimeout(600);
+              }],
             ['admin',       'Administration',  'System',   '/admin/system/admin'],
             ['packages',    'Software',        'System',   '/admin/system/package-manager'],
             ['startup',     'Startup',         'System',   '/admin/system/startup'],
+            ['crontab',     'Scheduled Tasks', 'System',   '/admin/system/crontab'],
             ['flash',       'Backup / Flash',  'System',   '/admin/system/flash'],
             ['upnp',        'UPnP',            'Services', '/admin/services/upnp'],
             ['ddns',        'Dynamic DNS',     'Services', '/admin/services/ddns'],
             ['wol',         'Wake on LAN',     'Services', '/admin/services/wol'],
+            ['mobile-menu', 'Mobile navigation', 'Navigation', '/admin/status/overview',
+              async (p, device) => {
+                if (device !== 'mobile') return false;
+                const b = p.locator('.menu-toggle, .showSide, #menu-toggle, [aria-label*="menu" i], [aria-controls*="menu" i]').first();
+                if (!(await b.count())) return false;
+                await b.click({ timeout: 5000 });
+                await p.waitForTimeout(700);
+              }],
           ];
-          const DEVICES = { desktop: { width: 1366, height: 850 }, mobile: { width: 390, height: 844 } };
-          const SCHEMES = ['light', 'dark'];
 
           const manifest = [];
           const fresh = () => ({ js: [], bad: [], failed: [], console: [] });
 
-          async function settle(page, ms) {
-            await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-            await page.waitForTimeout(ms);
+          async function launch() {
+            try { return await chromium.launch({ channel: 'chrome' }); }
+            catch (e) {
+              console.log('Không dùng được Chrome hệ thống, chuyển sang Chromium của Playwright');
+              return await chromium.launch();
+            }
+          }
+
+          async function settle(page, extra = 900) {
+            await page.waitForFunction(() => !document.querySelector('.spinning'), null, { timeout: 10000 }).catch(() => {});
+            await page.evaluate(() => document.fonts.ready).catch(() => {});
+            await page.waitForTimeout(extra);
+          }
+
+          async function fillLogin(page, pass) {
+            const pwd = page.locator('input[type="password"]').first();
+            await pwd.waitFor({ state: 'visible', timeout: 15000 });
+            const user = page.locator('input[name="luci_username"], input[type="text"]').first();
+            if (await user.count()) await user.fill(USER);
+            await pwd.fill(pass);
+            return pwd;
+          }
+
+          async function submitLogin(page, pwd) {
+            const btn = page.locator('button[type="submit"], input[type="submit"], .cbi-button-positive, .cbi-button-login').first();
+            if (await btn.count()) await btn.click();
+            else await pwd.press('Enter');
           }
 
           async function login(page) {
             await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
-            const pwd = page.locator('input[type="password"]');
-            await pwd.waitFor({ state: 'visible', timeout: 15000 });
-            
-            const user = page.locator('input[name="luci_username"], input[type="text"]').first();
-            if (await user.count() > 0) {
-              await user.fill('root');
-            }
-            await pwd.fill('root');
+            const pwd = await fillLogin(page, PASS);
+            await submitLogin(page, pwd);
+            await page.locator('input[type="password"]').first().waitFor({ state: 'detached', timeout: 20000 });
+            await settle(page, 800);
+          }
 
-            const btn = page.locator('button[type="submit"], input[type="submit"], .cbi-button-apply, .cbi-button-login').first();
-            if (await btn.count() > 0) {
-              await btn.click();
-            } else {
-              await pwd.press('Enter');
-            }
-
-            await pwd.waitFor({ state: 'detached', timeout: 15000 }).catch(() => {});
-            await settle(page, 1000);
+          async function contrast(page) {
+            if (!AXE) return null;
+            try {
+              await page.addScriptTag({ path: AXE });
+              return await page.evaluate(async () => {
+                const r = await window.axe.run(document, { runOnly: { type: 'rule', values: ['color-contrast'] }, resultTypes: ['violations'] });
+                const v = r.violations[0];
+                return v ? { count: v.nodes.length, sample: v.nodes.slice(0, 3).map(n => n.target.join(' ')) } : { count: 0, sample: [] };
+              });
+            } catch (e) { return null; }
           }
 
           async function record(page, o) {
             const issues = [];
             const add = (l, t) => issues.push({ l, t });
-            const st = o.resp ? o.resp.status() : 0;
-            if (!o.expect.includes(st)) add('e', 'HTTP ' + st + ' (mong đợi ' + o.expect.join('/') + ')');
+            const isLogin = o.kind === 'login';
+
+            if (o.resp && !o.expect.includes(o.resp.status()))
+              add('e', 'HTTP ' + o.resp.status() + ' (mong đợi ' + o.expect.join('/') + ')');
 
             const info = await page.evaluate(async () => {
               await document.fonts.ready;
@@ -561,14 +879,17 @@ jobs:
               const main = document.querySelector('#maincontent, main, .main');
               return {
                 title: document.title,
+                lang: document.documentElement.getAttribute('lang') || '',
+                hasViewport: !!document.querySelector('meta[name="viewport"]'),
                 hasTheme: sheets.some(h => h.includes('material3')),
                 fontsErr: [...document.fonts].filter(f => f.status === 'error').map(f => f.family),
+                brokenImgs: [...document.images].filter(i => i.complete && i.naturalWidth === 0).map(i => (i.getAttribute('src') || '').slice(0, 80)),
                 alerts: [...document.querySelectorAll('.alert-message.error, .alert-message.danger, .alert-message.warning')]
                   .map(e => e.textContent.trim().replace(/\s+/g, ' ').slice(0, 200)).filter(Boolean),
                 hasLogin: !!document.querySelector('input[name="luci_password"]'),
                 overflow: document.documentElement.scrollWidth - window.innerWidth,
                 textLen: (main ? main.innerText : document.body.innerText).trim().length,
-                head: document.body.innerText.slice(0, 2000),
+                head: document.body.innerText.slice(0, 2500),
                 hasL: typeof window.L !== 'undefined',
                 bg: getComputedStyle(document.body).backgroundColor,
                 height: document.documentElement.scrollHeight,
@@ -576,19 +897,23 @@ jobs:
             });
 
             if (!info.hasTheme) add('e', 'Không nạp cascade.css của theme');
-            if (!info.hasL) add('e', 'ReferenceError: L is not defined (chưa có luci.js)');
-            if (o.id !== 'login' && info.hasLogin) add('e', 'Mất phiên đăng nhập');
+            if (!isLogin && !info.hasL) add('e', 'ReferenceError: L is not defined (chưa có luci.js)');
+            if (!isLogin && info.hasLogin) add('e', 'Mất phiên đăng nhập');
             if (info.textLen < 20) add('e', 'Nội dung trang trống');
-            if (/Failed to load template|Unable to compile|Syntax error|Reference error|RPC call failed|Not Found|Forbidden/i.test(info.head))
+            if (/Failed to load template|Unable to compile|Syntax error|Reference error|Runtime error|Unhandled|TypeError|RPC call failed|Not Found|Forbidden|Access denied/i.test(info.head))
               add('e', 'Trang hiển thị lỗi LuCI/ucode');
             for (const f of info.fontsErr) add('e', 'Font không nạp được: ' + f);
+            for (const s of info.brokenImgs) add('e', 'Ảnh hỏng: ' + s);
             for (const t of o.bag.js) add('e', 'JS: ' + t);
             for (const t of o.bag.bad) add('e', 'Tài nguyên lỗi: ' + t);
             for (const t of o.bag.failed) add('e', 'Request fail: ' + t);
-            for (const t of info.alerts) add('w', 'Cảnh báo trên trang: ' + t);
-            for (const t of o.bag.console.slice(0, 3)) add('w', 'Console: ' + t);
-            if (o.device === 'mobile' && info.overflow > 2) add('w', 'Tràn ngang ' + info.overflow + 'px trên mobile');
+            for (const t of o.bag.console.slice(0, 4))
+              add(/RPC call|Access denied|not found|Method not found/i.test(t) ? 'e' : 'w', 'Console: ' + t);
+            if (!o.expectAlert) for (const t of info.alerts) add('w', 'Cảnh báo trên trang: ' + t);
+            if (info.overflow > 2) add('w', 'Tràn ngang ' + info.overflow + 'px (' + o.device + ')');
             if (!info.title) add('w', 'Thiếu <title>');
+            if (!info.lang) add('w', 'Thẻ <html> thiếu thuộc tính lang');
+            if (o.device === 'mobile' && !info.hasViewport) add('w', 'Thiếu meta viewport trên mobile');
 
             const name = o.id + '-' + o.device + '-' + o.scheme;
             const vw = DEVICES[o.device].width;
@@ -599,6 +924,9 @@ jobs:
             const meta = await sharp(buf).metadata();
             await sharp(buf).webp({ quality: 82 }).toFile('dist/shots/' + name + '.webp');
             await sharp(buf).resize(480, 360, { fit: 'cover', position: 'top' }).webp({ quality: 72 }).toFile('dist/shots/' + name + '-t.webp');
+
+            const c = await contrast(page);
+            if (c && c.count > 0) add('w', 'Tương phản màu thấp: ' + c.count + ' phần tử (vd: ' + c.sample.join(' | ') + ')');
 
             manifest.push({
               id: o.id, title: o.title, group: o.group, device: o.device, scheme: o.scheme,
@@ -625,10 +953,23 @@ jobs:
                 bag.bad.push(r.status() + ' ' + r.url().replace(ORIGIN, ''));
             });
 
+            // Trang đăng nhập
             bag = fresh();
             const r0 = await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
             await settle(page, 800);
-            await record(page, { id: 'login', title: 'Login', group: 'Auth', device, scheme, resp: r0, expect: [200, 403], bag });
+            await record(page, { id: 'login', title: 'Login', group: 'Auth', device, scheme, resp: r0, expect: [200, 403], bag, kind: 'login' });
+
+            // Đăng nhập sai mật khẩu
+            try {
+              bag = fresh();
+              await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
+              const pwd = await fillLogin(page, 'wrong-password');
+              await submitLogin(page, pwd);
+              await page.waitForTimeout(1800);
+              await record(page, { id: 'login-error', title: 'Login (wrong password)', group: 'Auth', device, scheme, resp: null, expect: [], bag, kind: 'login', expectAlert: true });
+            } catch (e) {
+              console.log('::warning::login-error ' + device + '/' + scheme + ': ' + e.message.split('\n')[0]);
+            }
 
             try {
               await login(page);
@@ -643,10 +984,12 @@ jobs:
               try {
                 bag = fresh();
                 const resp = await page.goto(BASE + path, { waitUntil: 'domcontentloaded' });
-                await settle(page, id === 'realtime' ? 3000 : 1200);
+                await settle(page, id === 'realtime' ? 4000 : 900);
                 if (action) {
-                  try { await action(page); }
-                  catch (e) { bag.console.push('Bước thao tác thất bại: ' + e.message.split('\n')[0]); }
+                  let res;
+                  try { res = await action(page, device); }
+                  catch (e) { bag.console.push('Thao tác thất bại: ' + e.message.split('\n')[0]); }
+                  if (res === false) continue;
                 }
                 await record(page, { id, title, group, device, scheme, resp, expect: [200], bag });
               } catch (e) {
@@ -656,64 +999,93 @@ jobs:
             await ctx.close();
           }
 
-          const browser = await chromium.launch();
-          for (const device of Object.keys(DEVICES)) {
-            for (const scheme of SCHEMES) {
-              await run(browser, device, scheme);
+          function finish() {
+            const order = PAGES.map(p => p[0]);
+            const rank = id => id === 'login' ? -2 : id === 'login-error' ? -1 : order.indexOf(id);
+            manifest.sort((a, b) => rank(a.id) - rank(b.id) || a.device.localeCompare(b.device) || a.scheme.localeCompare(b.scheme));
+
+            let same = 0, pairs = 0;
+            for (const m of manifest.filter(x => x.scheme === 'light')) {
+              const d = manifest.find(x => x.id === m.id && x.device === m.device && x.scheme === 'dark');
+              if (d) { pairs++; if (d.bg === m.bg) same++; }
+            }
+            const darkSame = pairs > 0 && same / pairs >= 0.8;
+
+            const groupIssues = lvl => {
+              const map = new Map();
+              for (const m of manifest) for (const i of m.issues.filter(x => x.l === lvl)) {
+                const k = m.id + ' :: ' + i.t;
+                if (!map.has(k)) map.set(k, new Set());
+                map.get(k).add(m.device + '/' + m.scheme);
+              }
+              return [...map.entries()].map(([k, v]) => ({ k, where: [...v].join(', ') }));
+            };
+            const errs = groupIssues('e');
+            const warns = groupIssues('w');
+
+            const summary = { total: manifest.length, errors: errs.length, warns: warns.length, darkSame, generated: new Date().toISOString() };
+            fs.writeFileSync('dist/manifest.json', JSON.stringify({ summary, items: manifest }));
+            console.log('Đã chụp ' + manifest.length + ' ảnh; ' + errs.length + ' lỗi, ' + warns.length + ' cảnh báo');
+
+            for (const e of errs.slice(0, 40)) console.log('::error::' + e.k + ' [' + e.where + ']');
+            for (const w of warns.slice(0, 40)) console.log('::warning::' + w.k + ' [' + w.where + ']');
+            if (darkSame) console.log('::warning::Dark mode gần như không đổi màu nền so với light');
+
+            if (errs.length) fs.appendFileSync('checks/errors', 'x\n'.repeat(Math.min(errs.length, 500)));
+            if (warns.length) fs.appendFileSync('checks/warns', 'x\n'.repeat(Math.min(warns.length, 500)));
+
+            if (process.env.GITHUB_STEP_SUMMARY) {
+              const modes = [['desktop', 'light'], ['desktop', 'dark'], ['mobile', 'light'], ['mobile', 'dark']];
+              const ids = [...new Set(manifest.map(m => m.id))];
+              let md = '\n## Kiểm tra từng trang (' + manifest.length + ' ảnh)\n\n';
+              md += '- Lỗi: **' + errs.length + '**, cảnh báo: **' + warns.length + '**\n';
+              if (darkSame) md += '- ⚠️ Dark mode gần như không đổi màu nền so với light\n';
+              md += '\n| Trang | Desktop sáng | Desktop tối | Mobile sáng | Mobile tối |\n|---|---|---|---|---|\n';
+              for (const id of ids) {
+                const title = manifest.find(m => m.id === id).title;
+                const cells = modes.map(([d, s]) => {
+                  const m = manifest.find(x => x.id === id && x.device === d && x.scheme === s);
+                  if (!m) return '–';
+                  return m.issues.some(i => i.l === 'e') ? '❌' : m.issues.length ? '⚠️' : '✅';
+                });
+                md += '| ' + title + ' | ' + cells.join(' | ') + ' |\n';
+              }
+              if (errs.length) md += '\n### Lỗi\n' + errs.map(e => '- ❌ `' + e.k + '` — ' + e.where).join('\n') + '\n';
+              if (warns.length) md += '\n### Cảnh báo\n' + warns.slice(0, 60).map(w => '- ⚠️ `' + w.k + '` — ' + w.where).join('\n') + '\n';
+              fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
             }
           }
-          await browser.close();
 
-          const order = PAGES.map(p => p[0]);
-          manifest.sort((a, b) =>
-            (a.id === 'login' ? -1 : b.id === 'login' ? 1 : order.indexOf(a.id) - order.indexOf(b.id))
-            || a.device.localeCompare(b.device) || a.scheme.localeCompare(b.scheme));
-
-          let same = 0, pairs = 0;
-          for (const m of manifest.filter(x => x.scheme === 'light')) {
-            const d = manifest.find(x => x.id === m.id && x.device === m.device && x.scheme === 'dark');
-            if (d) { pairs++; if (d.bg === m.bg) same++; }
-          }
-          const darkSame = pairs > 0 && same / pairs >= 0.8;
-
-          const groupIssues = lvl => {
-            const map = new Map();
-            for (const m of manifest) for (const i of m.issues.filter(x => x.l === lvl)) {
-              const k = m.id + ' :: ' + i.t;
-              if (!map.has(k)) map.set(k, new Set());
-              map.get(k).add(m.device + '/' + m.scheme);
-            }
-            return [...map.entries()].map(([k, v]) => ({ k, where: [...v].join(', ') }));
-          };
-          const errs = groupIssues('e');
-          const warns = groupIssues('w');
-
-          const summary = {
-            total: manifest.length, errors: errs.length, warns: warns.length,
-            darkSame, generated: new Date().toISOString(),
-          };
-          fs.writeFileSync('dist/manifest.json', JSON.stringify({ summary, items: manifest }));
-          console.log('Đã chụp ' + manifest.length + ' ảnh; ' + errs.length + ' lỗi, ' + warns.length + ' cảnh báo');
-
-          for (const e of errs.slice(0, 40)) console.log('::error::' + e.k + ' [' + e.where + ']');
-          for (const w of warns.slice(0, 40)) console.log('::warning::' + w.k + ' [' + w.where + ']');
-          if (darkSame) console.log('::warning::Dark mode gần như không đổi màu nền so với light');
-
-          if (errs.length) fs.appendFileSync('checks/errors', 'x\n'.repeat(Math.min(errs.length, 500)));
-          if (warns.length) fs.appendFileSync('checks/warns', 'x\n'.repeat(Math.min(warns.length, 500)));
-
-          if (process.env.GITHUB_STEP_SUMMARY) {
-            let md = '\n## Kiểm tra từng trang (' + manifest.length + ' ảnh)\n\n';
-            md += '- Lỗi: **' + errs.length + '**, cảnh báo: **' + warns.length + '**\n';
-            if (darkSame) md += '- ⚠️ Dark mode gần như không đổi màu nền so với light\n';
-            if (errs.length) md += '\n### Lỗi\n' + errs.map(e => '- ❌ `' + e.k + '` — ' + e.where).join('\n') + '\n';
-            if (warns.length) md += '\n### Cảnh báo\n' + warns.slice(0, 60).map(w => '- ⚠️ `' + w.k + '` — ' + w.where).join('\n') + '\n';
-            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
+          const browser = await launch();
+          try {
+            await Promise.all(Object.keys(DEVICES).map(async (device) => {
+              for (const scheme of SCHEMES) await run(browser, device, scheme);
+            }));
+          } finally {
+            await browser.close().catch(() => {});
+            finish();
           }
           END_CAPTURE
-          node capture.mjs
+          CHECK_CONTRAST="$CHECK_CONTRAST" node tools/capture.mjs
 
-      # ---------- Album UI ----------
+      - name: Scan server logs
+        if: steps.ready.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set +e
+          source checks/lib.sh
+          section "Log của web server"
+          docker logs owrt 2>&1 > checks/container.log
+          hits=$(grep -Ei 'syntax error|runtime error|reference error|traceback|ucode: |segfault' checks/container.log | sort | uniq -c | sort -rn | head -n 5)
+          if [ -n "$hits" ]; then
+            warn "Log server có lỗi ucode: $(echo "$hits" | head -n 3 | tr '\n' ' ')"
+          else
+            ok "Log server không có lỗi ucode"
+          fi
+
+      # ------------------------------------------------------------------
+      # Album
+      # ------------------------------------------------------------------
       - name: Build album UI
         if: always()
         run: |
@@ -723,7 +1095,8 @@ jobs:
           <!DOCTYPE html>
           <html lang="vi"><head><meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>luci-theme-material3 · Preview</title>
+          <meta name="color-scheme" content="light dark">
+          <title>__TITLE__ · Preview</title>
           <style>
           :root{--bg:#fef7ff;--sf:#f3edf7;--fg:#1d1b20;--mut:#49454f;--pri:#6750a4;--onpri:#fff;--bd:#cac4d0;--warn:#b26a00;--err:#b3261e}
           @media(prefers-color-scheme:dark){:root{--bg:#141218;--sf:#211f26;--fg:#e6e0e9;--mut:#cac4d0;--pri:#d0bcff;--onpri:#381e72;--bd:#49454f;--warn:#ffb951;--err:#f2b8b5}}
@@ -759,10 +1132,11 @@ jobs:
           .lbimg.actual img{max-width:none}
           #lbissue{max-height:25vh;overflow:auto;padding:8px 14px;background:#2b1b1b;font-size:13px;display:none}
           #lbissue div{margin:2px 0}
+          footer{padding:0 20px 24px;color:var(--mut);font-size:13px}
           a{color:inherit}
           </style></head><body>
           <header>
-            <h1>luci-theme-material3 — preview từ LuCI thật</h1>
+            <h1>__TITLE__ — preview từ LuCI thật</h1>
             <div id="sum"></div>
             <div class="bar">
               <span class="seg" id="fDevice"></span>
@@ -773,6 +1147,7 @@ jobs:
             </div>
           </header>
           <main id="main"></main>
+          <footer>Phím tắt trong ảnh lớn: ← → chuyển ảnh · L đổi sáng/tối · M đổi desktop/mobile · F phóng to · Esc đóng · <a href="diagnostics.txt">log chẩn đoán</a></footer>
           <div id="lb">
             <div class="lbbar">
               <button id="prev">←</button><button id="next">→</button>
@@ -784,7 +1159,7 @@ jobs:
               <button id="close">✕</button>
             </div>
             <div id="lbissue"></div>
-            <div class="lbimg" id="lbimg"><img id="lbpic" alt=""></div>
+            <div class="lbimg" id="lbimg"><img id="lbpic" alt="" decoding="async"></div>
           </div>
           <script>
           const $ = s => document.querySelector(s);
@@ -836,6 +1211,9 @@ jobs:
           }
           $('#main').onclick = e => { const c = e.target.closest('.card'); if (c) open(data[+c.dataset.i]); };
 
+          function variant(x, key, v) {
+            return data.find(y => y.id===x.id && y.device===(key==='device'?v:x.device) && y.scheme===(key==='scheme'?v:x.scheme));
+          }
           function open(x) {
             cur = x;
             location.hash = `${x.id}-${x.device}-${x.scheme}`;
@@ -843,27 +1221,30 @@ jobs:
             $('#lbpic').src = x.full;
             $('#lbtitle').textContent = x.title;
             const arr = list.includes(x) ? list : data;
-            $('#lbpos').textContent = `${arr.indexOf(x)+1}/${arr.length}`;
+            const n = arr.length, i = arr.indexOf(x);
+            $('#lbpos').textContent = `${i+1}/${n}`;
             $('#dl').href = x.full;
+            [arr[(i+1)%n], arr[(i-1+n)%n]].forEach(y => { if (y) new Image().src = y.full; });
             const bad = $('#lbissue');
             bad.style.display = x.issues.length ? 'block' : 'none';
-            bad.innerHTML = x.issues.map(i => `<div class="${i.l}">${i.l==='e'?'✖':'⚠'} ${esc(i.t)}</div>`).join('');
-            const variantBtns = (el, key, vals) => {
+            bad.innerHTML = x.issues.map(it => `<div class="${it.l}">${it.l==='e'?'✖':'⚠'} ${esc(it.t)}</div>`).join('');
+            const btns = (el, key, vals) => {
               el.innerHTML = vals.map(v => `<button data-v="${v}" class="${x[key]===v?'on':''}">${LBL[v]}</button>`).join('');
-              el.onclick = e => {
-                const v = e.target.dataset.v; if (!v) return;
-                const t = data.find(y => y.id===x.id && y.device===(key==='device'?v:x.device) && y.scheme===(key==='scheme'?v:x.scheme));
-                if (t) open(t);
-              };
+              el.onclick = e => { const v = e.target.dataset.v; if (!v) return; const t = variant(x, key, v); if (t) open(t); };
             };
-            variantBtns($('#vDevice'), 'device', ['desktop','mobile']);
-            variantBtns($('#vScheme'), 'scheme', ['light','dark']);
+            btns($('#vDevice'), 'device', ['desktop','mobile']);
+            btns($('#vScheme'), 'scheme', ['light','dark']);
             $('#lbimg').scrollTop = 0;
           }
           function close() { $('#lb').classList.remove('open'); history.replaceState(null, '', location.pathname); }
           function nav(d) {
             const arr = list.includes(cur) ? list : data;
             open(arr[(arr.indexOf(cur) + d + arr.length) % arr.length]);
+          }
+          function flip(key) {
+            const v = key === 'device' ? (cur.device === 'desktop' ? 'mobile' : 'desktop') : (cur.scheme === 'light' ? 'dark' : 'light');
+            const t = variant(cur, key, v);
+            if (t) open(t);
           }
           function openFromHash() {
             const h = location.hash.slice(1);
@@ -875,29 +1256,51 @@ jobs:
           $('#next').onclick = () => nav(1);
           $('#fit').onclick = () => $('#lbimg').classList.toggle('actual');
           $('#lbimg').onclick = e => { if (e.target.id === 'lbimg') close(); };
+          let tx = null;
+          $('#lbimg').addEventListener('touchstart', e => { tx = e.touches[0].clientX; }, {passive:true});
+          $('#lbimg').addEventListener('touchend', e => {
+            if (tx === null) return;
+            const dx = e.changedTouches[0].clientX - tx; tx = null;
+            if (Math.abs(dx) > 70 && !$('#lbimg').classList.contains('actual')) nav(dx < 0 ? 1 : -1);
+          }, {passive:true});
           addEventListener('keydown', e => {
             if (!$('#lb').classList.contains('open')) return;
+            const k = e.key.toLowerCase();
             if (e.key === 'Escape') close();
             else if (e.key === 'ArrowLeft') nav(-1);
             else if (e.key === 'ArrowRight') nav(1);
-            else if (e.key.toLowerCase() === 'f') $('#lbimg').classList.toggle('actual');
+            else if (k === 'f') $('#lbimg').classList.toggle('actual');
+            else if (k === 'l') flip('scheme');
+            else if (k === 'm') flip('device');
           });
           </script></body></html>
           END_ALBUM
+          sed -i "s|__TITLE__|${SITE_TITLE}|g" dist/index.html
 
-      # ---------- Log chẩn đoán + trang dự phòng ----------
+      # ------------------------------------------------------------------
+      # Log chẩn đoán và trang dự phòng
+      # ------------------------------------------------------------------
       - name: Diagnostics
         if: always()
         run: |
           mkdir -p dist
           {
             echo "=== trạng thái các bước ==="
-            echo "prep: ${{ steps.prep.outcome }}"
-            echo "boot: ${{ steps.boot.outcome }}"
+            echo "base_load:  ${{ steps.base_load.outcome }}"
+            echo "base_build: ${{ steps.base_build.outcome }}"
+            echo "boot:       ${{ steps.boot.outcome }}"
+            echo "theme:      ${{ steps.theme.outcome }}"
+            echo "ready:      ${{ steps.ready.outcome }}"
+            echo "=== docker ps ===";     docker ps -a
             echo "=== ps ===";            docker exec owrt ps
             echo "=== ubus objects ===";  docker exec owrt ubus list
+            echo "=== ip addr ===";       docker exec owrt ip addr
+            echo "=== lan status ===";    docker exec owrt ubus call network.interface.lan status
+            echo "=== themes ===";        docker exec owrt ls -la /usr/share/ucode/luci/template/themes/
+            echo "=== luci.themes ===";   docker exec owrt uci -q show luci.themes
             echo "=== http ===";          curl -is -m 10 http://127.0.0.1:8080/cgi-bin/luci/ | head -n 30
-            echo "=== docker logs ===";   docker logs owrt 2>&1 | tail -n 60
+            echo "=== logread ===";       docker exec owrt logread | tail -n 80
+            echo "=== docker logs ===";   docker logs owrt 2>&1 | tail -n 80
           } > dist/diagnostics.txt 2>&1 || true
           cat dist/diagnostics.txt
 
@@ -918,7 +1321,9 @@ jobs:
             } > dist/index.html
           fi
 
-      # ---------- Deploy GitHub Pages ----------
+      # ------------------------------------------------------------------
+      # Deploy (cùng job, chạy trừ khi bị hủy)
+      # ------------------------------------------------------------------
       - name: Upload Pages artifact
         if: ${{ !cancelled() }}
         uses: actions/upload-pages-artifact@v3
@@ -934,23 +1339,31 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           echo "Page: ${{ steps.deployment.outputs.page_url }}"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "🔗 **Preview:** ${{ steps.deployment.outputs.page_url }}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo ""
+            echo "🔗 **Preview:** ${{ steps.deployment.outputs.page_url }}"
+            echo ""
+            echo "Dung lượng site: $(du -sh dist | cut -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- Tổng kết ----------
+      # ------------------------------------------------------------------
+      # Tổng kết
+      # ------------------------------------------------------------------
       - name: Final gate
         if: always()
         run: |
-          if [ "${{ steps.prep.outcome }}" != "success" ] || [ "${{ steps.boot.outcome }}" != "success" ]; then
+          if [ "${{ steps.ready.outcome }}" != "success" ]; then
             echo "::error::Không dựng được router giả, web chỉ hiện log chẩn đoán"
             echo "- ❌ Không dựng được router giả (xem trang web để đọc log)" >> "$GITHUB_STEP_SUMMARY"
           fi
+          o=$(wc -l < checks/oks)
           e=$(wc -l < checks/errors)
           w=$(wc -l < checks/warns)
-          echo "Tổng kết: $e lỗi, $w cảnh báo"
+          echo "Tổng kết: $o đạt, $e lỗi, $w cảnh báo"
           {
             echo ""
             echo "## Tổng kết"
+            echo "- Đạt: **$o**"
             echo "- Lỗi: **$e**"
             echo "- Cảnh báo: **$w**"
           } >> "$GITHUB_STEP_SUMMARY"
